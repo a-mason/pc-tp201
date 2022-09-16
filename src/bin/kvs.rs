@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, Args};
+use kvs::Result;
 
 #[derive(Debug, Args)]
 struct SetCommand {
@@ -35,8 +36,8 @@ struct KvArgs {
     method: KvMethod,
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args = KvArgs::parse();
-    unimplemented!("unimplemented");
-    // println!("{:?}", args.method);
+    println!("{:?}", args.method);
+    Ok(())
 }
