@@ -1,5 +1,7 @@
+use std::path;
+
 use clap::{Parser, Subcommand, Args};
-use kvs::Result;
+use kvs::{Result, KvStore};
 
 #[derive(Debug, Args)]
 struct SetCommand {
@@ -38,6 +40,21 @@ struct KvArgs {
 
 fn main() -> Result<()> {
     let args = KvArgs::parse();
+    let mut store: KvStore<String, String> = KvStore::open(path::Path::new("./db_dir"))?;
     println!("{:?}", args.method);
+
+    let result = match args.method {
+        KvMethod::Set(command) => store.set(command.key, command.value),
+        KvMethod::Get(command) => store.get(command.key),
+        KvMethod::Rm(command) => store.remove(command.key),
+    }?;
+    match result {
+        Some(val) => {
+            println!("{}", val);
+        },
+        None => {
+            println!("Key not found");
+        }
+    }
     Ok(())
 }
