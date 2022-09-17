@@ -40,21 +40,25 @@ struct KvArgs {
 
 fn main() -> Result<()> {
     let args = KvArgs::parse();
-    let mut store: KvStore<String, String> = KvStore::open(path::Path::new("./db_dir"))?;
-    println!("{:?}", args.method);
+    let mut store: KvStore<String, String> = KvStore::open(path::Path::new("./"))?;
 
-    let result = match args.method {
+    match args.method {
         KvMethod::Set(command) => store.set(command.key, command.value),
-        KvMethod::Get(command) => store.get(command.key),
-        KvMethod::Rm(command) => store.remove(command.key),
-    }?;
-    match result {
-        Some(val) => {
-            println!("{}", val);
-        },
-        None => {
-            println!("Key not found");
+        KvMethod::Get(command) => {
+            let response = store.get(command.key)?;
+            match &response {
+                Some(val) => { println!("{}", val); },
+                None => { println!("Key not found"); }
+            }
+            Ok(response)
         }
-    }
+        KvMethod::Rm(command) => {
+            let response = store.remove(command.key);
+            if Result::is_err(&response) {
+                println!("Key not found");
+            }
+            response
+        }
+    }?;
     Ok(())
 }

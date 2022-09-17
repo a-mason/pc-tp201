@@ -115,7 +115,6 @@ where
     where
         V: Value,
     {
-        println!("Getting key {:?} from map {:?}", key, self.inner_map);
         if let Some(offset) = self.inner_map.get(&key) {
             let mut file = OpenOptions::new()
                 .read(true)
@@ -123,11 +122,9 @@ where
             file.seek(SeekFrom::Start(offset.0 as u64))?;
             let mut buf = vec![0u8; offset.1];
             file.read_exact(&mut buf)?;
-            println!("Getting key {:?} at offset {:?}", key, offset);
             match serde_json::from_slice(&buf)? {
                 KVCommand::Set(kv) => {
                     let _hidden: K =  kv.key;
-                    // println!("fetching key {:?}", hidden);
                     Ok(Some(kv.value))
                 }
                 _ => Ok(None),
@@ -161,7 +158,6 @@ where
         V: Value
     {
         let mut store = KvStore::new(path)?;
-        let mut map = HashMap::new();
         let mut next_offset = 0;
         let file = OpenOptions::new().read(true).open(store.path_to_file.as_ref())?;
         store.total_bytes = file.metadata()?.len() as usize;
@@ -170,18 +166,14 @@ where
             let size = deserialized.byte_offset() - next_offset;
             match deser.unwrap() {
                 KVCommand::Set(kv) => {
-                    map.insert(kv.key.clone(), Some(kv.value));
                     store.inner_map.insert(kv.key, (next_offset, size));
                 },
                 KVCommand::Rm(key) => {
-                    map.insert(key.clone(), None);
                     store.inner_map.insert(key, (next_offset, size));
                 },
             }
             next_offset += size;
         }
-        // println!("Existing value map {:?}", map);
-        // println!("Existing meta map {:?}", store.inner_map);
         Ok(store)
     }
 }
