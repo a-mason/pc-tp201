@@ -7,6 +7,7 @@ use std::io::{Write, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use std::{collections::HashMap, hash::Hash};
 use std::path::{Path};
 
@@ -68,8 +69,19 @@ where
 
 pub type Result<T> = std::result::Result<T, KvError>;
 
-pub struct KvStore<K, V> {
-    inner_map: HashMap<K, (usize, usize)>,
+struct ValueData {
+    size: usize,
+    offset: usize,
+    file_path: PathBuf,
+}
+
+pub struct KvStore<K, V>
+where
+    K: Key,
+    V: Value,
+{
+    dir_path: Box<PathBuf>,
+    inner_map: HashMap<K, ValueData>,
     files: Vec<PathBuf>,
     total_bytes: usize,
     phantom: PhantomData<V>
@@ -89,11 +101,15 @@ where
             files.push(file.unwrap().path());
         }
         if files.is_empty() {
-            let path = dir_path.join(format!("{:?}.kvs", SystemTime::now()));
-            fs::File::create(path.clone())?;
+            let path = dir_path.join(format!(
+                "{}.kvs",
+                SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_nanos().to_string())
+            );
+            fs::File::create(&path)?;
             files.push(path);
         }
         Ok(KvStore {
+            dir_path: Box::new(dir_path.to_owned()),
             inner_map: HashMap::new(),
             files,
             total_bytes: 0,
@@ -107,11 +123,12 @@ where
         let kv = KV::new(key.clone(), val.clone());
         let serialized = serde_json::to_string(&KVCommand::Set(kv))?;
         let buf = serialized.as_bytes();
-        self.inner_map.insert(key, (self.total_bytes, buf.len()));
+        let file_path = self.files.last().ok_or(KvError::FileListEmpty)?;
+        self.inner_map.insert(key, ValueData { offset: self.total_bytes, size: buf.len(), file_path: file_path.clone() });
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
-            .open(self.files.last().ok_or(KvError::FileListEmpty)?)
+            .open(file_path)
             .unwrap();
         file.write_all(buf)?;
         self.total_bytes += buf.len();
@@ -121,12 +138,12 @@ where
     where
         V: Value,
     {
-        if let Some(offset) = self.inner_map.get(&key) {
+        if let Some(value_data) = self.inner_map.get(&key) {
             let mut file = OpenOptions::new()
                 .read(true)
-                .open(self.files.last().ok_or(KvError::FileListEmpty)?)?;
-            file.seek(SeekFrom::Start(offset.0 as u64))?;
-            let mut buf = vec![0u8; offset.1];
+                .open(value_data.file_path.clone() )?;
+            file.seek(SeekFrom::Start(value_data.offset as u64))?;
+            let mut buf = vec![0u8; value_data.size];
             file.read_exact(&mut buf)?;
             match serde_json::from_slice(&buf)? {
                 KVCommand::Set(kv) => {
@@ -146,11 +163,12 @@ where
         if let Ok(Some(val)) = self.get(key.clone()) {
             let serialized = serde_json::to_string(&KVCommand::Rm::<K, V>(key.clone()))?;
             let buf = serialized.as_bytes();
-            self.inner_map.insert(key, (self.total_bytes, buf.len()));
+            let file_path = self.files.last().ok_or(KvError::FileListEmpty)?;
+            self.inner_map.insert(key, ValueData { offset: self.total_bytes, size: buf.len(), file_path: file_path.clone()  });
             let mut file = OpenOptions::new()
                 .write(true)
                 .append(true)
-                .open(self.files.last().ok_or(KvError::FileListEmpty)?)
+                .open(file_path)
                 .unwrap();
             file.write_all(serialized.as_bytes())?;
             self.total_bytes += buf.len();
@@ -165,18 +183,23 @@ where
     {
         let mut store = KvStore::new(path)?;
         let mut next_offset = 0;
-        for file in &store.files {
-            let file = OpenOptions::new().read(true).open(file)?;
+        for file_path in &store.files {
+            let file = OpenOptions::new().read(true).open(file_path.clone())?;
             store.total_bytes = file.metadata()?.len() as usize;
             let mut deserialized: StreamDeserializer<serde_json::de::IoRead<std::fs::File>, KVCommand<K, V>> = serde_json::Deserializer::from_reader(file).into_iter();
             while let Some(deser) = deserialized.next() {
                 let size = deserialized.byte_offset() - next_offset;
+                let value_data = ValueData {
+                    offset: next_offset,
+                    size,
+                    file_path: file_path.clone(),
+                };
                 match deser.unwrap() {
                     KVCommand::Set(kv) => {
-                        store.inner_map.insert(kv.key, (next_offset, size));
+                        store.inner_map.insert(kv.key, value_data);
                     },
                     KVCommand::Rm(key) => {
-                        store.inner_map.insert(key, (next_offset, size));
+                        store.inner_map.insert(key, value_data);
                     },
                 }
                 next_offset += size;
@@ -185,19 +208,62 @@ where
         Ok(store)
     }
 
-    fn compact_file(&mut self, path: &Path) -> Result<()> {
-        let file = OpenOptions::new().read(true).open(path)?;
-        let mut map = HashMap::new();
+    pub fn compact_files(&mut self, cleanup_inner_map: bool) -> Result<()> {
+        for file in self.files.clone().iter() {
+            self.compact_file(file.as_path(), cleanup_inner_map)?;
+        }
+        return Ok(());
+    }
+
+    fn compact_file(&mut self, path: &Path, cleanup_inner_map: bool) -> Result<()> {
+        let file = OpenOptions::new().read(true).open(path.clone())?;
+        let mut set_map = HashMap::new();
+        let mut rm_vec = vec![];
         let mut deserialized: StreamDeserializer<serde_json::de::IoRead<std::fs::File>, KVCommand<K, V>> = serde_json::Deserializer::from_reader(file).into_iter();
         while let Some(deser) = deserialized.next() {
             match deser.unwrap() {
                 KVCommand::Set(kv) => {
-                    map.insert(kv.key, kv.value);
+                    set_map.insert(kv.key, kv.value);
                 },
-                _ => {}
+                KVCommand::Rm(k)  => {
+                    rm_vec.push(k);
+                }
             }
         }
-        let file = OpenOptions::new().read(true).open(path)?;
+        let compacted_path = self.dir_path.join(format!(
+            "{}.kvs",
+            SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_nanos().to_string())
+        );
+        let compacted_file = fs::File::create(&compacted_path)?;
+        let mut next_offset = 0;
+        for entry in set_map {
+            let size = deserialized.byte_offset() - next_offset;
+            let value_data = ValueData {
+                offset: next_offset,
+                size,
+                file_path: compacted_path.clone(),
+            };
+            serde_json::to_writer(&compacted_file, &KVCommand::Set(KV::new(entry.0.clone(), entry.1)))?;
+            if cleanup_inner_map {
+                if let Some(v_data) = self.inner_map.get(&entry.0) {
+                    if v_data.file_path == path {
+                        self.inner_map.insert(entry.0, value_data);
+                    }
+                }
+            }
+            next_offset += size;
+        }
+        if cleanup_inner_map {
+            for key in rm_vec {
+                if let Some(v_data) = self.inner_map.get(&key) {
+                    if v_data.file_path == path {
+                        self.inner_map.remove(&key);
+                    }
+                }
+            }
+        }
+        self.files.retain(|f| f != &path );
+        self.files.push(compacted_path);
         Ok(())
     }
 }

@@ -286,7 +286,7 @@ fn compaction() -> Result<()> {
             continue;
         }
         // Compaction triggered.
-
+        store.compact_files(false)?;
         drop(store);
         // reopen and check content.
         let mut store = KvStore::open(temp_dir.path())?;
