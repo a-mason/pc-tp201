@@ -11,8 +11,16 @@ use std::time::UNIX_EPOCH;
 use std::{collections::HashMap, hash::Hash};
 use std::path::{Path};
 
+use clap::ArgEnum;
 use serde::{Serialize, Deserialize};
 use serde_cbor::StreamDeserializer;
+
+
+#[derive(Debug, ArgEnum, Clone)]
+pub enum KvsEngine {
+    Sled,
+    Kvs,
+}
 
 #[derive(Debug)]
 pub enum KvError {

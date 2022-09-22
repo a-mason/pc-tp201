@@ -1,4 +1,4 @@
-use std::path;
+use std::{path, net::{SocketAddr, IpAddr, Ipv4Addr}};
 
 use clap::{Parser, Subcommand, Args};
 use kvs::{Result, KvStore};
@@ -25,7 +25,7 @@ struct RmCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum KvMethod {
+enum Method {
     Set(SetCommand),
     Get(GetCommand),
     Rm(RmCommand),
@@ -33,18 +33,23 @@ enum KvMethod {
 
 #[derive(Debug, Parser)] // requires `derive` feature
 #[clap(author, version, about, long_about = None)]
-struct KvArgs {
+struct KvClientArgs {
+    /// method to call on the database
     #[clap(subcommand)]
-    method: KvMethod,
+    method: Method,
+
+    /// address to connect to the server
+    #[clap(short, long, value_parser, default_value_t = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4000))]
+    addr: SocketAddr,
 }
 
 fn main() -> Result<()> {
-    let args = KvArgs::parse();
+    let args = KvClientArgs::parse();
     let mut store: KvStore<String, String> = KvStore::open(path::Path::new("./"))?;
 
     match args.method {
-        KvMethod::Set(command) => store.set(command.key, command.value),
-        KvMethod::Get(command) => {
+        Method::Set(command) => store.set(command.key, command.value),
+        Method::Get(command) => {
             let response = store.get(command.key)?;
             match &response {
                 Some(val) => { println!("{}", val); },
@@ -52,7 +57,7 @@ fn main() -> Result<()> {
             }
             Ok(response)
         }
-        KvMethod::Rm(command) => {
+        Method::Rm(command) => {
             let response = store.remove(command.key);
             if Result::is_err(&response) {
                 println!("Key not found");

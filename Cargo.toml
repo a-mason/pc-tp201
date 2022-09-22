@@ -6,12 +6,16 @@ description = "A key-value store"
 edition = "2021"
 
 [dev-dependencies]
-assert_cmd = "2.0.4"
-predicates = "2.1.1"
-tempfile = "3"
-walkdir = "2"
+assert_cmd = "^2.0.4"
+criterion = "0.4.0"
+predicates = "^2.1.1"
+rand = "0.8.5"
+tempfile = "^3.3.0"
+walkdir = "^2.3.2"
 
 [dependencies]
 clap = { version = "^3.2.20", features = ["derive"] }
 serde = { version = "^1.0.144", features = ["derive"] }
 serde_cbor = "0.10"
+log = "0.4.17"
+stderrlog = "0.5.3"
