@@ -1,5 +1,4 @@
-use std::{path, net::{SocketAddr, IpAddr, Ipv4Addr}};
-
+use std::{path, net::{SocketAddr, IpAddr, Ipv4Addr, TcpStream, Shutdown}, io::{Write, Read}};
 use clap::{Parser, Subcommand, Args};
 use kvs::{Result, KvStore};
 
@@ -43,27 +42,34 @@ struct KvClientArgs {
     addr: SocketAddr,
 }
 
+fn make_request(args: KvClientArgs, stream: &mut TcpStream) -> Result<Option<String>> {
+    stream.write_all(format!("{:?}", args.method).as_bytes())?;
+    stream.shutdown(Shutdown::Write)?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    println!("response from server: {}", response);
+    Ok(Some(response))
+}
+
 fn main() -> Result<()> {
     let args = KvClientArgs::parse();
-    let mut store: KvStore<String, String> = KvStore::open(path::Path::new("./"))?;
 
-    match args.method {
-        Method::Set(command) => store.set(command.key, command.value),
-        Method::Get(command) => {
-            let response = store.get(command.key)?;
-            match &response {
-                Some(val) => { println!("{}", val); },
-                None => { println!("Key not found"); }
+    let mut stream = TcpStream::connect(args.addr)?;
+
+    match make_request(args, &mut stream) {
+        Ok(optional) => {
+            match optional {
+                Some(val) => {
+                    println!("{}", val);
+                },
+                None => {
+                    println!("Key not found!");
+                }
             }
-            Ok(response)
+        },
+        Err(e) => {
+            println!("{:?}", e);
         }
-        Method::Rm(command) => {
-            let response = store.remove(command.key);
-            if Result::is_err(&response) {
-                println!("Key not found");
-            }
-            response
-        }
-    }?;
+    }
     Ok(())
 }

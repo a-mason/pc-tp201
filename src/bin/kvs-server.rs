@@ -1,7 +1,7 @@
-use std::net::{SocketAddr, Ipv4Addr, IpAddr};
+use std::{net::{SocketAddr, Ipv4Addr, IpAddr, TcpListener}, io::{Read, Write}};
 use log::*;
 use clap::{Parser};
-use kvs::KvsEngine;
+use kvs::{KvsEngine, Result};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -18,7 +18,7 @@ struct KvServerArgs {
 }
 
 
-fn main() {
+fn main() -> Result<()> {
   let args = KvServerArgs::parse();
 
   stderrlog::new()
@@ -26,8 +26,32 @@ fn main() {
   .verbosity(args.verbose)
   .init()
   .unwrap();
-  
-  debug!("{:?}", args);
 
-  info!("version: {}", VERSION);
+  warn!("version: {}, configuration: {:?}", VERSION, args);
+
+  let listener = TcpListener::bind(args.addr)?;
+
+  for stream in listener.incoming() {
+    match stream {
+      Ok(mut s) => {
+        let mut message = String::new();
+        let bytes_read = s.read_to_string(&mut message)?;
+        info!("Got {} bytes on stream: {}", bytes_read, message);
+        match s.write_all(message.as_bytes()) {
+          Ok(()) => {
+            debug!("response successfully sent");
+          },
+          Err(e) => {
+            warn!("Could not send response: {:?}", e);
+          }
+        }
+        drop(s);
+      },
+      Err(e) => {
+        warn!("Errored in stream: {}", e);
+      }
+    }
+  }
+
+  Ok(())
 }
