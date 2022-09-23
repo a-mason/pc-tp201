@@ -12,7 +12,7 @@ use std::{collections::HashMap, hash::Hash};
 use std::path::{Path};
 
 use serde::{Serialize, Deserialize};
-use serde_json::StreamDeserializer;
+use serde_cbor::StreamDeserializer;
 
 #[derive(Debug)]
 pub enum KvError {
@@ -23,8 +23,8 @@ pub enum KvError {
     Other,
 }
 
-impl From<serde_json::Error> for KvError {
-    fn from(serde_err: serde_json::Error) -> Self {
+impl From<serde_cbor::Error> for KvError {
+    fn from(serde_err: serde_cbor::Error) -> Self {
         KvError::SerializationError(serde_err.to_string())
     }
 }
@@ -118,7 +118,7 @@ where
     }
 
     fn write_command(&mut self, command: &KVCommand<K, V>, key: K) -> Result<()> {
-        let serialized = serde_json::to_vec(command)?;
+        let serialized = serde_cbor::to_vec(command)?;
         let file_path = self.files.last().ok_or(KvError::FileListEmpty)?;
         self.inner_map.insert(key, ValueData { offset: self.bytes_in_last_file, size: serialized.len(), file_path: file_path.clone() });
         let mut file = OpenOptions::new()
@@ -144,7 +144,7 @@ where
             file.seek(SeekFrom::Start(value_data.offset as u64))?;
             let mut buf = vec![0u8; value_data.size];
             file.read_exact(&mut buf)?;
-            match serde_json::from_slice(&buf)? {
+            match serde_cbor::from_slice(&buf)? {
                 KVCommand::Set(kv) => {
                     let _key: K = kv.0;
                     Ok(Some(kv.1))
@@ -163,13 +163,13 @@ where
             Err(KvError::NonExistantKey)
         }
     }
-    pub fn open(path: &Path) -> Result<KvStore<K, V>> {
-        let mut store = KvStore::new(path)?;
+    pub fn open(db_path: &Path) -> Result<KvStore<K, V>> {
+        let mut store = KvStore::new(db_path)?;
         for file_path in &store.files {
             let mut next_offset = 0;
-            let file = OpenOptions::new().read(true).open(file_path)?;
-            store.bytes_in_last_file = file.metadata()?.len() as usize;
-            let mut deserialized: StreamDeserializer<serde_json::de::IoRead<std::fs::File>, KVCommand<K, V>> = serde_json::Deserializer::from_reader(file).into_iter();
+            let file_bytes = fs::read(file_path)?;
+            store.bytes_in_last_file = file_bytes.len();
+            let mut deserialized: StreamDeserializer<_, KVCommand<K, V>> = serde_cbor::Deserializer::from_slice(&file_bytes).into_iter();
             while let Some(deser) = deserialized.next() {
                 let size = deserialized.byte_offset() - next_offset;
                 let value_data = ValueData {
@@ -196,7 +196,7 @@ where
         let file_paths_to_delete = self.files.clone();
         for file_path in &self.files {
             let file = OpenOptions::new().read(true).open(file_path)?;
-            let mut deserialized: StreamDeserializer<serde_json::de::IoRead<std::fs::File>, KVCommand<K, V>> = serde_json::Deserializer::from_reader(file).into_iter();
+            let mut deserialized: StreamDeserializer<serde_cbor::de::IoRead<std::fs::File>, KVCommand<K, V>> = serde_cbor::Deserializer::from_reader(file).into_iter();
             while let Some(deser) = deserialized.next() {
                 match deser.unwrap() {
                     KVCommand::Set(kv) => {
@@ -215,16 +215,15 @@ where
         for entry in &set_map {
             match entry.1 {
                 Some(v) => {
-                    let serialized = serde_json::to_string(&KVCommand::Set((entry.0, v)))?;
-                    let buf = serialized.as_bytes();
+                    let serialized = serde_cbor::to_vec(&KVCommand::Set((entry.0, v)))?;
                     let value_data = ValueData {
                         offset: next_offset,
-                        size: buf.len(),
+                        size: serialized.len(),
                         file_path: compacted_path.clone(),
                     };
                     self.inner_map.insert(entry.0.clone(), value_data);
-                    compacted_file.write_all(buf)?;
-                    next_offset += buf.len();
+                    compacted_file.write_all(&serialized)?;
+                    next_offset += serialized.len();
                 },
                 None => {
                     self.inner_map.remove(entry.0);
