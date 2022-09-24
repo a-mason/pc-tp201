@@ -209,7 +209,6 @@ where
 
     pub fn compact_files(&mut self) -> Result<()> {
         let mut set_map = HashMap::new();
-        let file_paths_to_delete = self.files.clone();
         for file_path in &self.files {
             let file = OpenOptions::new().read(true).open(file_path)?;
             let mut deserialized: StreamDeserializer<serde_json::de::IoRead<std::fs::File>, KvRecord<K, V>> = serde_json::Deserializer::from_reader(file).into_iter();
@@ -246,11 +245,11 @@ where
                 }
             }
         }
-        self.files = vec![compacted_path];
-        self.bytes_in_last_file = next_offset;
-        for file in &file_paths_to_delete {
+        for file in &self.files {
             fs::remove_file(file)?;
         }
+        self.files = vec![compacted_path];
+        self.bytes_in_last_file = next_offset;
         Ok(())
     }
 }
