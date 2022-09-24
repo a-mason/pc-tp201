@@ -1,4 +1,4 @@
-use std::{net::{SocketAddr, Ipv4Addr, IpAddr, TcpListener}, io::{Read, Write}};
+use std::{net::{SocketAddr, Ipv4Addr, IpAddr, TcpListener}, io::{Write}, path::Path};
 use log::*;
 use clap::{Parser};
 use kvs::{KvsEngine, Result};
@@ -21,6 +21,8 @@ struct KvServerArgs {
 fn main() -> Result<()> {
   let args = KvServerArgs::parse();
 
+  let mut store = kvs::KvStore::open(Path::new("./"))?;
+
   stderrlog::new()
   .module(module_path!())
   .verbosity(args.verbose)
@@ -34,17 +36,18 @@ fn main() -> Result<()> {
   for stream in listener.incoming() {
     match stream {
       Ok(mut s) => {
-        let mut message = String::new();
-        let bytes_read = s.read_to_string(&mut message)?;
-        info!("Got {} bytes on stream: {}", bytes_read, message);
-        match s.write_all(message.as_bytes()) {
-          Ok(()) => {
-            debug!("response successfully sent");
-          },
-          Err(e) => {
-            warn!("Could not send response: {:?}", e);
-          }
-        }
+        let deserialized: kvs::KvCommand<String, String> = serde_json::from_reader(&s)?;
+        info!("Got from stream: {:?}", deserialized);
+        let response = match deserialized {
+          kvs::KvCommand::Set(kv) => store.set(kv.0, kv.1),
+          kvs::KvCommand::Get(k) => store.get(k),
+          kvs::KvCommand::Rm(k) => store.remove(k)
+        }.unwrap();
+        match response {
+          Some(val) => s.write_all(val.as_bytes()),
+          None => s.write_all(b"none")
+        }?;
+        s.write(b"\n\n")?;
         drop(s);
       },
       Err(e) => {

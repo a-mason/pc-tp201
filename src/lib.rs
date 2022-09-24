@@ -13,7 +13,7 @@ use std::path::{Path};
 
 use clap::ArgEnum;
 use serde::{Serialize, Deserialize};
-use serde_cbor::StreamDeserializer;
+use serde_json::StreamDeserializer;
 
 
 #[derive(Debug, ArgEnum, Clone)]
@@ -31,8 +31,8 @@ pub enum KvError {
     Other,
 }
 
-impl From<serde_cbor::Error> for KvError {
-    fn from(serde_err: serde_cbor::Error) -> Self {
+impl From<serde_json::Error> for KvError {
+    fn from(serde_err: serde_json::Error) -> Self {
         KvError::SerializationError(serde_err.to_string())
     }
 }
@@ -50,9 +50,16 @@ impl Key for String {}
 impl Value for String {}
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum KVCommand<K, V> {
+pub enum KvRecord<K, V> {
     Set((K, V)),
     Rm(K)
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum KvCommand<K, V> {
+    Set((K, V)),
+    Rm(K),
+    Get(K),
 }
 
 pub type Result<T> = std::result::Result<T, KvError>;
@@ -106,18 +113,19 @@ where
     }
 
     fn new(dir_path: &Path) -> Result<KvStore<K, V>> {
-        if !dir_path.exists() {
-            fs::create_dir_all(dir_path)?;
+        let db_path = dir_path.join("db");
+        if !db_path.exists() {
+            fs::create_dir_all(&db_path)?;
         }
         let mut files = vec![];
-        for file in fs::read_dir(dir_path)? {
+        for file in fs::read_dir(&db_path)? {
             files.push(file.unwrap().path());
         }
         if files.is_empty() {
-            files.push(KvStore::<K,V>::alloc_new_file(dir_path)?);
+            files.push(KvStore::<K,V>::alloc_new_file(&db_path)?);
         }
         Ok(KvStore {
-            dir_path: dir_path.to_owned(),
+            dir_path: db_path,
             inner_map: HashMap::new(),
             files,
             bytes_in_last_file: 0,
@@ -125,8 +133,8 @@ where
         })
     }
 
-    fn write_command(&mut self, command: &KVCommand<K, V>, key: K) -> Result<()> {
-        let serialized = serde_cbor::to_vec(command)?;
+    fn write_command(&mut self, command: &KvRecord<K, V>, key: K) -> Result<()> {
+        let serialized = serde_json::to_vec(command)?;
         let file_path = self.files.last().ok_or(KvError::FileListEmpty)?;
         self.inner_map.insert(key, ValueData { offset: self.bytes_in_last_file, size: serialized.len(), file_path: file_path.clone() });
         let mut file = OpenOptions::new()
@@ -141,7 +149,7 @@ where
     }
 
     pub fn set(&mut self, key: K, val: V) -> Result<Option<V>> {
-        self.write_command(&KVCommand::Set((key.clone(), val.clone())), key)?;
+        self.write_command(&KvRecord::Set((key.clone(), val.clone())), key)?;
         Ok(Some(val))
     }
     pub fn get(&mut self, key: K) -> Result<Option<V>> {
@@ -152,8 +160,8 @@ where
             file.seek(SeekFrom::Start(value_data.offset as u64))?;
             let mut buf = vec![0u8; value_data.size];
             file.read_exact(&mut buf)?;
-            match serde_cbor::from_slice(&buf)? {
-                KVCommand::Set(kv) => {
+            match serde_json::from_slice(&buf)? {
+                KvRecord::Set(kv) => {
                     let _key: K = kv.0;
                     Ok(Some(kv.1))
                 }
@@ -165,7 +173,7 @@ where
     }
     pub fn remove(&mut self, key: K) -> Result<Option<V>> {
         if let Ok(Some(val)) = self.get(key.clone()) {
-            self.write_command(&KVCommand::Rm::<K, V>(key.clone()), key)?;
+            self.write_command(&KvRecord::Rm::<K, V>(key.clone()), key)?;
             Ok(Some(val))
         } else {
             Err(KvError::NonExistantKey)
@@ -177,7 +185,7 @@ where
             let mut next_offset = 0;
             let file_bytes = fs::read(file_path)?;
             store.bytes_in_last_file = file_bytes.len();
-            let mut deserialized: StreamDeserializer<_, KVCommand<K, V>> = serde_cbor::Deserializer::from_slice(&file_bytes).into_iter();
+            let mut deserialized: StreamDeserializer<_, KvRecord<K, V>> = serde_json::Deserializer::from_slice(&file_bytes).into_iter();
             while let Some(deser) = deserialized.next() {
                 let size = deserialized.byte_offset() - next_offset;
                 let value_data = ValueData {
@@ -186,10 +194,10 @@ where
                     file_path: file_path.clone(),
                 };
                 match deser.unwrap() {
-                    KVCommand::Set(kv) => {
+                    KvRecord::Set(kv) => {
                         store.inner_map.insert(kv.0, value_data);
                     },
-                    KVCommand::Rm(key) => {
+                    KvRecord::Rm(key) => {
                         store.inner_map.insert(key, value_data);
                     },
                 }
@@ -204,13 +212,13 @@ where
         let file_paths_to_delete = self.files.clone();
         for file_path in &self.files {
             let file = OpenOptions::new().read(true).open(file_path)?;
-            let mut deserialized: StreamDeserializer<serde_cbor::de::IoRead<std::fs::File>, KVCommand<K, V>> = serde_cbor::Deserializer::from_reader(file).into_iter();
+            let mut deserialized: StreamDeserializer<serde_json::de::IoRead<std::fs::File>, KvRecord<K, V>> = serde_json::Deserializer::from_reader(file).into_iter();
             while let Some(deser) = deserialized.next() {
                 match deser.unwrap() {
-                    KVCommand::Set(kv) => {
+                    KvRecord::Set(kv) => {
                         set_map.insert(kv.0, Some(kv.1));
                     },
-                    KVCommand::Rm(k)  => {
+                    KvRecord::Rm(k)  => {
                         set_map.insert(k, None);
                     }
                 }
@@ -223,7 +231,7 @@ where
         for entry in &set_map {
             match entry.1 {
                 Some(v) => {
-                    let serialized = serde_cbor::to_vec(&KVCommand::Set((entry.0, v)))?;
+                    let serialized = serde_json::to_vec(&KvRecord::Set((entry.0, v)))?;
                     let value_data = ValueData {
                         offset: next_offset,
                         size: serialized.len(),
