@@ -1,6 +1,9 @@
-use std::{net::{SocketAddr, IpAddr, Ipv4Addr, TcpStream, Shutdown}, io::{Write}};
-use clap::{Parser, Subcommand, Args};
-use kvs::protocol::{KvRequest, KvResponse, KvError};
+use clap::{Args, Parser, Subcommand};
+use kvs::protocol::{KvError, KvRequest, KvResponse};
+use std::{
+    io::Write,
+    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream},
+};
 
 #[derive(Debug, Args)]
 struct SetArgs {
@@ -52,7 +55,10 @@ struct KvClientArgs {
     addr: SocketAddr,
 }
 
-fn make_request(command: &KvRequest<String, String>, mut stream: TcpStream) -> kvs::store::Result<KvResponse<String>> {
+fn make_request(
+    command: &KvRequest<String, String>,
+    mut stream: TcpStream,
+) -> kvs::store::Result<KvResponse<String>> {
     serde_json::to_writer(&mut stream, command)?;
     stream.write(b"\n\n")?;
     stream.shutdown(Shutdown::Write)?;
@@ -68,28 +74,26 @@ fn main() -> kvs::store::Result<()> {
     let server_command: KvRequest<String, String> = args.method.into();
 
     match make_request(&server_command, stream)?.value {
-        Ok(optional_value) => {
-            match optional_value {
-                Some(val) => {
-                    println!("{}", val);
-                    Ok(())
-                },
-                None => {
-                    match server_command {
-                        KvRequest::Get(_k) => {
-                            println!("Key not found!");
-                        }
-                        _ => {}
-                    };
-                    Ok(())
-                }
+        Ok(optional_value) => match optional_value {
+            Some(val) => {
+                println!("{}", val);
+                Ok(())
+            }
+            None => {
+                match server_command {
+                    KvRequest::Get(_k) => {
+                        println!("Key not found!");
+                    }
+                    _ => {}
+                };
+                Ok(())
             }
         },
         Err(e) => {
             match e {
                 KvError::NonExistantKey => {
                     eprintln!("Key not found!");
-                },
+                }
                 _ => {
                     eprintln!("{:?}", e);
                 }
