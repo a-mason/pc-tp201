@@ -1,6 +1,6 @@
-use std::{net::{SocketAddr, IpAddr, Ipv4Addr, TcpStream, Shutdown}, io::{Write, Read}};
+use std::{net::{SocketAddr, IpAddr, Ipv4Addr, TcpStream, Shutdown}, io::{Write}};
 use clap::{Parser, Subcommand, Args};
-use kvs::{Result, KvCommand};
+use kvs::protocol::{KvRequest, KvResponse, KvError};
 
 #[derive(Debug, Args)]
 struct SetArgs {
@@ -30,12 +30,12 @@ enum Method {
     Rm(RmArgs),
 }
 
-impl From<Method> for KvCommand<String, String> {
+impl From<Method> for KvRequest<String, String> {
     fn from(m: Method) -> Self {
         match m {
-            Method::Set(set_args) => KvCommand::Set((set_args.key, set_args.value)),
-            Method::Get(set_args) => KvCommand::Get(set_args.key),
-            Method::Rm(set_args) => KvCommand::Rm(set_args.key),
+            Method::Set(set_args) => KvRequest::Set((set_args.key, set_args.value)),
+            Method::Get(set_args) => KvRequest::Get(set_args.key),
+            Method::Rm(set_args) => KvRequest::Rm(set_args.key),
         }
     }
 }
@@ -52,37 +52,49 @@ struct KvClientArgs {
     addr: SocketAddr,
 }
 
-fn make_request(command: KvCommand<String, String>, mut stream: TcpStream) -> Result<Option<String>> {
-    serde_json::to_writer(&mut stream, &command)?;
+fn make_request(command: &KvRequest<String, String>, mut stream: TcpStream) -> kvs::store::Result<KvResponse<String>> {
+    serde_json::to_writer(&mut stream, command)?;
     stream.write(b"\n\n")?;
     stream.shutdown(Shutdown::Write)?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    println!("response from server: {}", response);
-    Ok(Some(response))
+    let response: KvResponse<String> = serde_json::from_reader(&stream)?;
+    Ok(response)
 }
 
-fn main() -> Result<()> {
+fn main() -> kvs::store::Result<()> {
     let args = KvClientArgs::parse();
 
     let stream = TcpStream::connect(args.addr)?;
 
-    let server_command: KvCommand<String, String> = args.method.into();
+    let server_command: KvRequest<String, String> = args.method.into();
 
-    match make_request(server_command, stream) {
-        Ok(optional) => {
-            match optional {
+    match make_request(&server_command, stream)?.value {
+        Ok(optional_value) => {
+            match optional_value {
                 Some(val) => {
                     println!("{}", val);
+                    Ok(())
                 },
                 None => {
-                    println!("Key not found!");
+                    match server_command {
+                        KvRequest::Get(_k) => {
+                            println!("Key not found!");
+                        }
+                        _ => {}
+                    };
+                    Ok(())
                 }
             }
         },
         Err(e) => {
-            println!("{:?}", e);
+            match e {
+                KvError::NonExistantKey => {
+                    eprintln!("Key not found!");
+                },
+                _ => {
+                    eprintln!("{:?}", e);
+                }
+            };
+            Err(e)
         }
     }
-    Ok(())
 }
