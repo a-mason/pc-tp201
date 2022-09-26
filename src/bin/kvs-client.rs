@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
-use kvs::protocol::{KvError, KvRequest, KvResponse};
+use kvs::protocol::{KvRequest, KvResponse};
+use kvs::{KvsError, Result};
 use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream},
@@ -58,7 +59,7 @@ struct KvClientArgs {
 fn make_request(
     command: &KvRequest<String, String>,
     mut stream: TcpStream,
-) -> kvs::store::Result<KvResponse<String>> {
+) -> Result<KvResponse<String>> {
     serde_json::to_writer(&mut stream, command)?;
     stream.write(b"\n\n")?;
     stream.shutdown(Shutdown::Write)?;
@@ -66,7 +67,7 @@ fn make_request(
     Ok(response)
 }
 
-fn main() -> kvs::store::Result<()> {
+fn main() -> Result<()> {
     let args = KvClientArgs::parse();
 
     let stream = TcpStream::connect(args.addr)?;
@@ -91,7 +92,7 @@ fn main() -> kvs::store::Result<()> {
         },
         Err(e) => {
             match e {
-                KvError::NonExistantKey => {
+                KvsError::NonExistantKey => {
                     eprintln!("Key not found!");
                 }
                 _ => {

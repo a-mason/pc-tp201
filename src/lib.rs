@@ -1,50 +1,36 @@
-use std::{
-    fs::{self, OpenOptions},
-    path::Path,
-};
-
-use crate::store::Result;
-use protocol::{KvError, KvsEngineType};
-
-pub fn parse_kv_config(db_path: &Path, engine: Option<KvsEngineType>) -> Result<KvsEngineType> {
-    if !db_path.exists() {
-        fs::create_dir_all(&db_path)?;
-    }
-    let config_file_path = db_path.join("config.info");
-    if config_file_path.exists() {
-        let previous_config: KvsEngineType = serde_json::from_reader(
-            OpenOptions::new()
-                .write(false)
-                .read(true)
-                .open(&config_file_path)
-                .unwrap(),
-        )?;
-        match engine {
-            Some(e) => {
-                if previous_config != e {
-                    return Err(KvError::WrongEngine);
-                }
-            }
-            _ => {}
-        };
-        Ok(previous_config)
-    } else {
-        let new_config_file = std::fs::File::create(&config_file_path)?;
-        let new_engine = engine.unwrap_or(KvsEngineType::Kvs);
-        serde_json::to_writer(new_config_file, &new_engine)?;
-        Ok(new_engine)
-    }
-}
+use serde::{Serialize, Deserialize};
 
 pub trait KvsEngine<K, V> {
     fn set(&mut self, key: K, value: V) -> Result<()>;
     fn get(&mut self, key: K) -> Result<Option<V>>;
     fn remove(&mut self, key: K) -> Result<()>;
 }
+pub type Result<T> = std::result::Result<T, KvsError>;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum KvsError {
+    FileListEmpty,
+    WrongEngine,
+    SerializationError(String),
+    IOError(String),
+    NonExistantKey,
+    Other,
+}
+
+impl From<serde_json::Error> for KvsError {
+    fn from(serde_err: serde_json::Error) -> Self {
+        KvsError::SerializationError(serde_err.to_string())
+    }
+}
+
+impl From<std::io::Error> for KvsError {
+    fn from(io_err: std::io::Error) -> Self {
+        KvsError::IOError(io_err.to_string())
+    }
+}
 
 pub mod protocol {
     use crate::Result;
-    use clap::ArgEnum;
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, Debug)]
@@ -57,22 +43,6 @@ pub mod protocol {
     #[derive(Serialize, Deserialize, Debug)]
     pub struct KvResponse<V> {
         pub value: Result<Option<V>>,
-    }
-
-    #[derive(Debug, ArgEnum, Clone, Serialize, Deserialize, PartialEq)]
-    pub enum KvsEngineType {
-        Sled,
-        Kvs,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub enum KvError {
-        FileListEmpty,
-        WrongEngine,
-        SerializationError(String),
-        IOError(String),
-        NonExistantKey,
-        Other,
     }
 }
 
@@ -93,20 +63,7 @@ pub mod store {
     use serde::{Deserialize, Serialize};
     use serde_json::StreamDeserializer;
 
-    use crate::protocol::KvError;
-    use crate::KvsEngine;
-
-    impl From<serde_json::Error> for KvError {
-        fn from(serde_err: serde_json::Error) -> Self {
-            KvError::SerializationError(serde_err.to_string())
-        }
-    }
-
-    impl From<std::io::Error> for KvError {
-        fn from(io_err: std::io::Error) -> Self {
-            KvError::IOError(io_err.to_string())
-        }
-    }
+    use crate::{KvsEngine, Result, KvsError};
 
     pub trait Key:
         Debug + Display + Clone + Eq + Hash + Serialize + for<'de> Deserialize<'de>
@@ -122,8 +79,6 @@ pub mod store {
         Set((K, V)),
         Rm(K),
     }
-
-    pub type Result<T> = std::result::Result<T, KvError>;
 
     struct ValueData {
         size: usize,
@@ -176,7 +131,7 @@ pub mod store {
                 self.write_command(&KvRecord::Rm::<K, V>(key.clone()), key)?;
                 Ok(())
             } else {
-                Err(KvError::NonExistantKey)
+                Err(KvsError::NonExistantKey)
             }
         }
     }
@@ -244,7 +199,7 @@ pub mod store {
 
         fn write_command(&mut self, command: &KvRecord<K, V>, key: K) -> Result<()> {
             let serialized = serde_json::to_vec(command)?;
-            let file_path = self.files.last().ok_or(KvError::FileListEmpty)?;
+            let file_path = self.files.last().ok_or(KvsError::FileListEmpty)?;
             self.inner_map.insert(
                 key,
                 ValueData {
@@ -356,7 +311,7 @@ pub mod store {
 pub mod sled {
     use std::path::Path;
 
-    use crate::{protocol::KvError, KvsEngine, Result};
+    use crate::{KvsError, KvsEngine, Result};
     use ::sled::Db;
 
     pub struct SledKvsEngine {
@@ -371,9 +326,9 @@ pub mod sled {
         }
     }
 
-    impl From<sled::Error> for KvError {
+    impl From<sled::Error> for KvsError {
         fn from(sled_err: sled::Error) -> Self {
-            KvError::IOError(sled_err.to_string())
+            KvsError::IOError(sled_err.to_string())
         }
     }
 
@@ -395,7 +350,7 @@ pub mod sled {
                     self.db.flush()?;
                     Ok(())
                 }
-                None => Err(KvError::NonExistantKey),
+                None => Err(KvsError::NonExistantKey),
             }
         }
     }

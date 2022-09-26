@@ -1,5 +1,5 @@
-use kvs::store::{KvStore, Result};
-use kvs::KvsEngine;
+use kvs::store::{KvStore};
+use kvs::{KvsEngine, Result};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
