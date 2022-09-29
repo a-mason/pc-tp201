@@ -1,12 +1,13 @@
-use clap::Parser;
 use clap::clap_derive::ArgEnum;
-use kvs::{KvsError, Result, KvsEngine};
+use clap::Parser;
+use kvs::{KvsEngine, KvsError, Result};
 use log::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::{
+    fs::{self, OpenOptions},
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
-    path::Path, fs::{OpenOptions, self},
+    path::Path,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -57,7 +58,6 @@ fn parse_kv_config(db_path: &Path, engine: Option<KvsEngineType>) -> Result<KvsE
         Ok(new_engine)
     }
 }
-
 
 fn main() -> kvs::Result<()> {
     stderrlog::new()

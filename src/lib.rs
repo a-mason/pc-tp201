@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 pub trait KvsEngine<K, V> {
     fn set(&mut self, key: K, value: V) -> Result<()>;
@@ -61,11 +61,9 @@ pub mod store {
     use std::time::UNIX_EPOCH;
     use std::{collections::HashMap, hash::Hash};
 
-    use rmp_serde::Deserializer;
-    use rmp_serde::decode::ReadReader;
     use serde::{Deserialize, Serialize};
 
-    use crate::{KvsEngine, Result, KvsError};
+    use crate::{KvsEngine, KvsError, Result};
 
     pub trait Key:
         Debug + Display + Clone + Eq + Hash + Serialize + for<'de> Deserialize<'de>
@@ -169,7 +167,7 @@ pub mod store {
         }
 
         fn alloc_new_file_if_needed(&mut self) -> Result<()> {
-            if self.bytes_in_last_file > 100000 {
+            if self.bytes_in_last_file > 1000000 {
                 if self.files.len() > 10 {
                     self.compact_files()?;
                     return Ok(());
@@ -233,13 +231,17 @@ pub mod store {
             Ok(())
         }
 
-        fn deserialize_files(files: &[PathBuf], mut f: impl FnMut(KvRecord<K, V>, ValueData) -> ()) -> Result<()> {
+        fn deserialize_files(
+            files: &[PathBuf],
+            mut f: impl FnMut(KvRecord<K, V>, ValueData) -> (),
+        ) -> Result<()> {
             for file_path in files {
                 let file = fs::read(&file_path)?;
                 let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(&file));
                 let mut position: u64 = 0;
                 while position < file.len() as u64 {
-                    let deserialized: KvRecord<K, V> = serde::Deserialize::deserialize(&mut deserializer)?;
+                    let deserialized: KvRecord<K, V> =
+                        serde::Deserialize::deserialize(&mut deserializer)?;
                     // println!("Deserialized: {:?}", deserialized);
                     let new_position = rmp_serde::decode::Deserializer::position(&deserializer);
                     let value_data = ValueData {
@@ -256,16 +258,17 @@ pub mod store {
 
         pub fn open(db_path: &Path) -> Result<KvStore<K, V>> {
             let mut store = KvStore::new(db_path)?;
-            KvStore::deserialize_files(&store.files, |deserialized: KvRecord<K, V>, value_data| {
-                match deserialized {
+            KvStore::deserialize_files(
+                &store.files,
+                |deserialized: KvRecord<K, V>, value_data| match deserialized {
                     KvRecord::Set(kv) => {
                         store.inner_map.insert(kv.0, value_data);
                     }
                     KvRecord::Rm(key) => {
                         store.inner_map.insert(key, value_data);
                     }
-                }
-            })?;
+                },
+            )?;
             Ok(store)
         }
 
@@ -326,7 +329,7 @@ pub mod store {
 pub mod sled {
     use std::path::Path;
 
-    use crate::{KvsError, KvsEngine, Result};
+    use crate::{KvsEngine, KvsError, Result};
     use ::sled::Db;
 
     pub struct SledKvsEngine {
