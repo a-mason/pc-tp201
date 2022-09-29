@@ -11,3 +11,4 @@ Cargo.lock
 
 db
 /benches/blobs
+/benches/*

@@ -34,14 +34,10 @@ fn bench_write(c: &mut Criterion) {
         SledKvsEngine::new(Path::new("./benches/sledstore")).unwrap();
 
     let mut group = c.benchmark_group("write");
-    let mut kv_vec = gen_keys_values(100, 1000000);
-    let mut sled_vec = kv_vec.clone();
-    let mut iteration = 0;
-    group.sample_size(100);
+    group.sample_size(10);
     group.bench_function("kvs_store", |b| {
+        let mut kv_vec = gen_keys_values(100, 1000);
         b.iter(|| {
-            iteration += 1;
-            println!("Iteration: {}", iteration);
             let (key, val) = kv_vec
                 .pop()
                 .unwrap_or(("key".to_string(), "value".to_string()));
@@ -49,6 +45,7 @@ fn bench_write(c: &mut Criterion) {
         })
     });
     group.bench_function("sled_store", |b| {
+        let mut sled_vec = gen_keys_values(100, 1000);
         b.iter(|| {
             let (key, val) = sled_vec
                 .pop()
