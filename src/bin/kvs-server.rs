@@ -106,6 +106,9 @@ fn main() -> kvs::Result<()> {
 
     match engine {
         KvsEngineType::Kvs => start_listening(args.addr, kvs::store::KvStore::open(path)?),
-        KvsEngineType::Sled => start_listening(args.addr, kvs::sled::SledKvsEngine::new(&path.join("sled"))?), // Need to implement Sled Engine
+        KvsEngineType::Sled => start_listening(
+            args.addr,
+            kvs::sled::SledKvsEngine::new(&path.join("sled"))?,
+        ), // Need to implement Sled Engine
     }
 }

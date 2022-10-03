@@ -28,10 +28,8 @@ fn gen_keys_values(num: usize, size: usize) -> Vec<(String, String)> {
 }
 
 fn bench_write(c: &mut Criterion) {
-    let mut kv_store: KvStore<String, String> =
-        KvStore::open(Path::new("./benches/kvstore")).unwrap();
-    let mut sled_store: SledKvsEngine =
-        SledKvsEngine::new(Path::new("./benches/sledstore")).unwrap();
+    let kv_store: KvStore<String, String> = KvStore::open(Path::new("./benches/kvstore")).unwrap();
+    let sled_store: SledKvsEngine = SledKvsEngine::new(Path::new("./benches/sledstore")).unwrap();
 
     let mut group = c.benchmark_group("write");
     group.sample_size(10);

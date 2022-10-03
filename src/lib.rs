@@ -30,6 +30,14 @@ impl From<std::io::Error> for KvsError {
 }
 
 pub mod thread_pool {
+    use std::{
+        sync::{
+            mpsc::{channel, Receiver, Sender},
+            Arc, Mutex,
+        },
+        thread::{self, JoinHandle},
+    };
+
     use crate::Result;
     pub trait ThreadPool {
         fn new(threads: u32) -> Result<Self>
@@ -46,31 +54,60 @@ pub mod thread_pool {
         where
             Self: Sized,
         {
-            todo!()
+            println!(
+                "Naive thread pool will just spin up unlimited threads regardless of param {}",
+                threads
+            );
+            Ok(NaiveThreadPool {})
         }
 
         fn spawn<F>(&self, job: F)
         where
             F: FnOnce() + Send + 'static,
         {
-            todo!()
+            thread::spawn(job);
         }
     }
 
-    pub struct SharedQueueThreadPool {}
+    type Job = Box<dyn FnOnce() + Send + 'static>;
+    struct Worker {
+        id: u32,
+        join_handle: JoinHandle<()>,
+    }
+    impl Worker {
+        fn new(id: u32, receiver: Arc<Mutex<Receiver<Job>>>) -> Self {
+            let join_handle = thread::spawn(move || {
+                while let Ok(job) = receiver.lock().unwrap().recv() {
+                    job();
+                }
+            });
+            Worker { id, join_handle }
+        }
+    }
+
+    pub struct SharedQueueThreadPool {
+        workers: Vec<Worker>,
+        sender: Sender<Job>,
+    }
     impl ThreadPool for SharedQueueThreadPool {
         fn new(threads: u32) -> Result<Self>
         where
             Self: Sized,
         {
-            todo!()
+            let (sender, receiver) = channel();
+            let receiver = Arc::new(Mutex::new(receiver));
+            let mut workers = Vec::with_capacity(threads as usize);
+            for i in 0..threads {
+                workers.push(Worker::new(i, Arc::clone(&receiver)));
+            }
+            Ok(SharedQueueThreadPool { workers, sender })
         }
 
         fn spawn<F>(&self, job: F)
         where
             F: FnOnce() + Send + 'static,
         {
-            todo!()
+            self.sender.send(Box::new(job)).unwrap();
         }
     }
 
@@ -135,7 +172,10 @@ pub mod store {
         Debug + Display + Clone + Eq + Hash + Serialize + for<'de> Deserialize<'de> + Send + 'static
     {
     }
-    pub trait Value: Debug + Display + Clone + Serialize + for<'de> Deserialize<'de> + Send + 'static {}
+    pub trait Value:
+        Debug + Display + Clone + Serialize + for<'de> Deserialize<'de> + Send + 'static
+    {
+    }
 
     impl Key for String {}
     impl Value for String {}
@@ -244,7 +284,7 @@ pub mod store {
             Ok(path)
         }
 
-        fn alloc_new_file_if_needed(&mut self) -> Result<()> {
+        fn alloc_new_file_if_needed(&self) -> Result<()> {
             let mut inner = self.inner.write()?;
             if inner.bytes_in_last_file > 1000000 {
                 if inner.inactive_files.len() >= 10 {
@@ -297,10 +337,7 @@ pub mod store {
                 size: serialized.len(),
                 file_path: inner_structs.active_file.clone(),
             };
-            inner_structs.key_map.insert(
-                key,
-                value_data,
-            );
+            inner_structs.key_map.insert(key, value_data);
             let mut file = OpenOptions::new()
                 .write(true)
                 .append(true)
@@ -308,6 +345,10 @@ pub mod store {
                 .unwrap();
             file.write_all(&serialized)?;
             inner_structs.bytes_in_last_file += serialized.len() as u64;
+            drop(inner_structs);
+            if let Err(err) = self.alloc_new_file_if_needed() {
+                println!("Error compacting: {:?}", err);
+            }
             Ok(())
         }
 
@@ -339,8 +380,12 @@ pub mod store {
         pub fn open(db_path: &Path) -> Result<KvStore<K, V>> {
             let mut inner = KvStore::<K, V>::new(db_path)?;
             let mut key_map = HashMap::new();
+            let all_files = [
+                inner.inactive_files.as_slice(),
+                vec![inner.active_file.clone()].as_slice(),
+            ].concat();
             KvStore::deserialize_files(
-                &[inner.inactive_files.as_slice(), vec![inner.active_file.clone()].as_slice()].concat(),
+                &all_files,
                 |deserialized: KvRecord<K, V>, value_data| match deserialized {
                     KvRecord::Set(kv) => {
                         key_map.insert(kv.0, value_data);
@@ -351,24 +396,31 @@ pub mod store {
                 },
             )?;
             inner.key_map = key_map;
-            Ok(KvStore { inner: Arc::new(RwLock::new(inner)), phantom: PhantomData })
+            Ok(KvStore {
+                inner: Arc::new(RwLock::new(inner)),
+                phantom: PhantomData,
+            })
         }
 
-        fn compact_files(& self) -> Result<()> {
+        fn compact_files(&self) -> Result<()> {
             let inner = self.inner.read()?;
             let mut set_map = HashMap::new();
             KvStore::deserialize_files(
-                &[inner.inactive_files.as_slice(), vec![inner.active_file.clone()].as_slice()].concat(),
-                |deserialized: KvRecord<K, V>, _| {
-                match deserialized {
+                &[
+                    inner.inactive_files.as_slice(),
+                    vec![inner.active_file.clone()].as_slice(),
+                ]
+                .concat(),
+                |deserialized: KvRecord<K, V>, _| match deserialized {
                     KvRecord::Set(kv) => {
                         set_map.insert(kv.0, Some(kv.1));
                     }
                     KvRecord::Rm(k) => {
                         set_map.insert(k, None);
                     }
-                }
-            })?;
+                },
+            )?;
+            drop(inner);
             let mut inner = self.inner.write()?;
             let compacted_path = KvStore::<K, V>::alloc_new_file(&inner.dir_path)?;
             let mut compacted_file = fs::File::create(&compacted_path)?;
@@ -402,16 +454,16 @@ pub mod store {
         }
     }
 
-    impl<K, V> Drop for KvStore<K, V>
-    where
-        K: Key,
-        V: Value,
-    {
-        fn drop(&mut self) {
-            self.compact_files()
-                .expect("Could not compact files on drop");
-        }
-    }
+    // impl<K, V> Drop for KvStore<K, V>
+    // where
+    //     K: Key,
+    //     V: Value,
+    // {
+    //     fn drop(&mut self) {
+    //         self.compact_files()
+    //             .expect("Could not compact files on drop");
+    //     }
+    // }
 }
 
 pub mod sled {
