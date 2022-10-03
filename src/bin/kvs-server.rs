@@ -59,30 +59,8 @@ fn parse_kv_config(db_path: &Path, engine: Option<KvsEngineType>) -> Result<KvsE
     }
 }
 
-fn main() -> kvs::Result<()> {
-    stderrlog::new()
-        .module(module_path!())
-        .verbosity(4)
-        .init()
-        .unwrap();
-    warn!("version: {}", VERSION);
-
-    let args = KvServerArgs::parse();
-
-    info!("configuration: {:?}", args);
-
-    let path = Path::new("./db");
-
-    let engine = parse_kv_config(path, args.engine)?;
-
-    info!("final engine: {:?}", engine);
-
-    let mut store: Box<dyn KvsEngine<String, String>> = match engine {
-        KvsEngineType::Kvs => Box::new(kvs::store::KvStore::open(path)?),
-        KvsEngineType::Sled => Box::new(kvs::sled::SledKvsEngine::new(&path.join("sled"))?), // Need to implement Sled Engine
-    };
-
-    let listener = TcpListener::bind(args.addr)?;
+fn start_listening(addr: SocketAddr, store: impl KvsEngine<String, String>) -> kvs::Result<()> {
+    let listener = TcpListener::bind(addr)?;
 
     for stream in listener.incoming() {
         match stream {
@@ -105,6 +83,29 @@ fn main() -> kvs::Result<()> {
             }
         }
     }
-
     Ok(())
+}
+
+fn main() -> kvs::Result<()> {
+    stderrlog::new()
+        .module(module_path!())
+        .verbosity(4)
+        .init()
+        .unwrap();
+    warn!("version: {}", VERSION);
+
+    let args = KvServerArgs::parse();
+
+    info!("configuration: {:?}", args);
+
+    let path = Path::new("./db");
+
+    let engine = parse_kv_config(path, args.engine)?;
+
+    info!("final engine: {:?}", engine);
+
+    match engine {
+        KvsEngineType::Kvs => start_listening(args.addr, kvs::store::KvStore::open(path)?),
+        KvsEngineType::Sled => start_listening(args.addr, kvs::sled::SledKvsEngine::new(&path.join("sled"))?), // Need to implement Sled Engine
+    }
 }

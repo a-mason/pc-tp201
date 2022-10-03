@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub trait KvsEngine<K, V, Clone = Self> {
+pub trait KvsEngine<K, V>: Clone + Send + 'static {
     fn set(&self, key: K, value: V) -> Result<()>;
     fn get(&self, key: K) -> Result<Option<V>>;
     fn remove(&self, key: K) -> Result<()>;
@@ -121,7 +121,6 @@ pub mod store {
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::PoisonError;
     use std::sync::RwLock;
     use std::time::SystemTime;
@@ -129,15 +128,14 @@ pub mod store {
     use std::{collections::HashMap, hash::Hash};
 
     use serde::{Deserialize, Serialize};
-    use stderrlog::new;
 
     use crate::{KvsEngine, KvsError, Result};
 
     pub trait Key:
-        Debug + Display + Clone + Eq + Hash + Serialize + for<'de> Deserialize<'de>
+        Debug + Display + Clone + Eq + Hash + Serialize + for<'de> Deserialize<'de> + Send + 'static
     {
     }
-    pub trait Value: Debug + Display + Clone + Serialize + for<'de> Deserialize<'de> {}
+    pub trait Value: Debug + Display + Clone + Serialize + for<'de> Deserialize<'de> + Send + 'static {}
 
     impl Key for String {}
     impl Value for String {}
@@ -162,6 +160,7 @@ pub mod store {
         key_map: HashMap<K, ValueData>,
     }
 
+    #[derive(Clone)]
     pub struct KvStore<K, V>
     where
         K: Key,
@@ -173,7 +172,7 @@ pub mod store {
 
     impl<K, V> KvsEngine<K, V> for KvStore<K, V>
     where
-        K: Key,
+        K: Key + Sync,
         V: Value,
     {
         fn set(&self, key: K, val: V) -> Result<()> {
@@ -252,15 +251,15 @@ pub mod store {
                     self.compact_files()?;
                     return Ok(());
                 }
-                let new_path = KvStore::<K, V>::alloc_new_file(&inner.dir_path)?;
-                inner.inactive_files.push(inner.active_file);
-                inner.active_file = new_path;
+                let old_active = inner.active_file.clone();
+                inner.inactive_files.push(old_active);
+                inner.active_file = KvStore::<K, V>::alloc_new_file(&inner.dir_path)?;
                 inner.bytes_in_last_file = 0;
             }
             Ok(())
         }
 
-        fn new(db_path: &Path) -> Result<KvStore<K, V>> {
+        fn new(db_path: &Path) -> Result<InnerStructs<K>> {
             if !db_path.exists() {
                 fs::create_dir_all(&db_path)?;
             }
@@ -281,28 +280,26 @@ pub mod store {
             if files.is_empty() {
                 files.push(KvStore::<K, V>::alloc_new_file(&db_path)?);
             }
-            Ok(KvStore {
-                inner: Arc::new(RwLock::new(InnerStructs {
-                    dir_path: db_path.to_owned(),
-                    key_map: HashMap::new(),
-                    active_file: files.pop().unwrap(),
-                    inactive_files: files,
-                    bytes_in_last_file,
-                })),
-                phantom: PhantomData,
+            Ok(InnerStructs {
+                dir_path: db_path.to_owned(),
+                key_map: HashMap::new(),
+                active_file: files.pop().unwrap(),
+                inactive_files: files,
+                bytes_in_last_file,
             })
         }
 
         fn write_command(&self, command: &KvRecord<K, V>, key: K) -> Result<()> {
             let serialized = rmp_serde::to_vec(command)?;
             let mut inner_structs = self.inner.write()?;
+            let value_data = ValueData {
+                offset: inner_structs.bytes_in_last_file,
+                size: serialized.len(),
+                file_path: inner_structs.active_file.clone(),
+            };
             inner_structs.key_map.insert(
                 key,
-                ValueData {
-                    offset: inner_structs.bytes_in_last_file,
-                    size: serialized.len(),
-                    file_path: inner_structs.active_file.clone(),
-                },
+                value_data,
             );
             let mut file = OpenOptions::new()
                 .write(true)
@@ -340,9 +337,8 @@ pub mod store {
         }
 
         pub fn open(db_path: &Path) -> Result<KvStore<K, V>> {
-            let store = KvStore::new(db_path)?;
+            let mut inner = KvStore::<K, V>::new(db_path)?;
             let mut key_map = HashMap::new();
-            let inner = store.inner.read()?;
             KvStore::deserialize_files(
                 &[inner.inactive_files.as_slice(), vec![inner.active_file.clone()].as_slice()].concat(),
                 |deserialized: KvRecord<K, V>, value_data| match deserialized {
@@ -354,9 +350,8 @@ pub mod store {
                     }
                 },
             )?;
-            let mut inner = store.inner.write()?;
             inner.key_map = key_map;
-            Ok(store)
+            Ok(KvStore { inner: Arc::new(RwLock::new(inner)), phantom: PhantomData })
         }
 
         fn compact_files(& self) -> Result<()> {
@@ -425,6 +420,7 @@ pub mod sled {
     use crate::{KvsEngine, KvsError, Result};
     use ::sled::Db;
 
+    #[derive(Clone)]
     pub struct SledKvsEngine {
         db: Db,
     }
