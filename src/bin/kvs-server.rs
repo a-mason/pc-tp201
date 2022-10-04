@@ -1,6 +1,6 @@
 use clap::clap_derive::ArgEnum;
 use clap::Parser;
-use kvs::{KvsEngine, KvsError, Result};
+use kvs::{thread_pool::NaiveThreadPool, thread_pool::ThreadPool, KvsEngine, KvsError, Result};
 use log::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -61,22 +61,31 @@ fn parse_kv_config(db_path: &Path, engine: Option<KvsEngineType>) -> Result<KvsE
 
 fn start_listening(addr: SocketAddr, store: impl KvsEngine<String, String>) -> kvs::Result<()> {
     let listener = TcpListener::bind(addr)?;
-
+    let thread_pool = NaiveThreadPool::new(10)?;
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
-                let deserialized: kvs::protocol::KvRequest<String, String> =
-                    serde_json::from_reader(&s)?;
-                info!("Got from stream: {:?}", deserialized);
-                let result = match deserialized {
-                    kvs::protocol::KvRequest::Set(kv) => store.set(kv.0, kv.1).map(|_| None),
-                    kvs::protocol::KvRequest::Get(k) => store.get(k),
-                    kvs::protocol::KvRequest::Rm(k) => store.remove(k).map(|_| None),
-                };
-                debug!("Response from store: {:?}", result);
-                serde_json::to_writer(&s, &kvs::protocol::KvResponse { value: result })?;
-                s.write(b"\n\n")?;
-                drop(s);
+                let store = store.clone();
+                thread_pool.spawn(move || match serde_json::from_reader(&s) {
+                    Ok(deserialized) => {
+                        debug!("Got from stream: {:?}", deserialized);
+                        let result = match deserialized {
+                            kvs::protocol::KvRequest::Set(kv) => {
+                                store.set(kv.0, kv.1).map(|_| None)
+                            }
+                            kvs::protocol::KvRequest::Get(k) => store.get(k),
+                            kvs::protocol::KvRequest::Rm(k) => store.remove(k).map(|_| None),
+                        };
+                        debug!("Response from store: {:?}", result);
+                        serde_json::to_writer(&s, &kvs::protocol::KvResponse { value: result })
+                            .unwrap();
+                        s.write(b"\n\n").unwrap();
+                        drop(s);
+                    }
+                    Err(err) => {
+                        info!("Could not parse message: {}", err.to_string());
+                    }
+                });
             }
             Err(e) => {
                 warn!("Errored in stream: {}", e);
@@ -89,7 +98,7 @@ fn start_listening(addr: SocketAddr, store: impl KvsEngine<String, String>) -> k
 fn main() -> kvs::Result<()> {
     stderrlog::new()
         .module(module_path!())
-        .verbosity(4)
+        .verbosity(2)
         .init()
         .unwrap();
     warn!("version: {}", VERSION);

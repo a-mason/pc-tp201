@@ -14,6 +14,7 @@ pub enum KvsError {
     SerializationError(String),
     IOError(String),
     NonExistantKey,
+    ThreadPoolBuildError(String),
     Other,
 }
 
@@ -26,6 +27,12 @@ impl From<serde_json::Error> for KvsError {
 impl From<std::io::Error> for KvsError {
     fn from(io_err: std::io::Error) -> Self {
         KvsError::IOError(io_err.to_string())
+    }
+}
+
+impl From<rayon::ThreadPoolBuildError> for KvsError {
+    fn from(rayon_err: rayon::ThreadPoolBuildError) -> Self {
+        KvsError::IOError(rayon_err.to_string())
     }
 }
 
@@ -111,20 +118,24 @@ pub mod thread_pool {
         }
     }
 
-    pub struct RayonThreadPool {}
+    pub struct RayonThreadPool {
+        pool: rayon::ThreadPool
+    }
     impl ThreadPool for RayonThreadPool {
         fn new(threads: u32) -> Result<Self>
         where
             Self: Sized,
         {
-            todo!()
+            Ok(RayonThreadPool {
+                pool: rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build()?
+            })
         }
 
         fn spawn<F>(&self, job: F)
         where
             F: FnOnce() + Send + 'static,
         {
-            todo!()
+            self.pool.install(job);
         }
     }
 }
@@ -383,18 +394,18 @@ pub mod store {
             let all_files = [
                 inner.inactive_files.as_slice(),
                 vec![inner.active_file.clone()].as_slice(),
-            ].concat();
-            KvStore::deserialize_files(
-                &all_files,
-                |deserialized: KvRecord<K, V>, value_data| match deserialized {
+            ]
+            .concat();
+            KvStore::deserialize_files(&all_files, |deserialized: KvRecord<K, V>, value_data| {
+                match deserialized {
                     KvRecord::Set(kv) => {
                         key_map.insert(kv.0, value_data);
                     }
                     KvRecord::Rm(key) => {
                         key_map.insert(key, value_data);
                     }
-                },
-            )?;
+                }
+            })?;
             inner.key_map = key_map;
             Ok(KvStore {
                 inner: Arc::new(RwLock::new(inner)),
