@@ -38,6 +38,7 @@ impl From<rayon::ThreadPoolBuildError> for KvsError {
 
 pub mod thread_pool {
     use std::{
+        panic::{self, AssertUnwindSafe},
         sync::{
             mpsc::{channel, Receiver, Sender},
             Arc, Mutex,
@@ -77,24 +78,49 @@ pub mod thread_pool {
     }
 
     type Job = Box<dyn FnOnce() + Send + 'static>;
+    enum ThreadPoolMessage {
+        Run(Job),
+        Shutdown,
+    }
     struct Worker {
         id: u32,
-        join_handle: JoinHandle<()>,
+        join_handle: Option<JoinHandle<()>>,
     }
     impl Worker {
-        fn new(id: u32, receiver: Arc<Mutex<Receiver<Job>>>) -> Self {
-            let join_handle = thread::spawn(move || {
-                while let Ok(job) = receiver.lock().unwrap().recv() {
-                    job();
+        fn new(id: u32, receiver: Arc<Mutex<Receiver<ThreadPoolMessage>>>) -> Self {
+            let join_handle = thread::spawn(move || loop {
+                match receiver.lock() {
+                    Ok(receiver) => match receiver.recv() {
+                        Ok(message) => match message {
+                            ThreadPoolMessage::Run(job) => {
+                                if let Err(e) = panic::catch_unwind(AssertUnwindSafe(job)) {
+                                    println!("Worker {} panicked running job {:?}", id, e);
+                                }
+                            }
+                            ThreadPoolMessage::Shutdown => {
+                                println!("Worker {} received message to shutdown", id);
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            println!("Worker {} received error reading from channel: {:?}", id, e);
+                        }
+                    },
+                    Err(e) => {
+                        println!("Worker {} failed to lock receiver: {:?}", id, e);
+                    }
                 }
             });
-            Worker { id, join_handle }
+            Worker {
+                id,
+                join_handle: Some(join_handle),
+            }
         }
     }
 
     pub struct SharedQueueThreadPool {
         workers: Vec<Worker>,
-        sender: Sender<Job>,
+        sender: Sender<ThreadPoolMessage>,
     }
     impl ThreadPool for SharedQueueThreadPool {
         fn new(threads: u32) -> Result<Self>
@@ -114,12 +140,38 @@ pub mod thread_pool {
         where
             F: FnOnce() + Send + 'static,
         {
-            self.sender.send(Box::new(job)).unwrap();
+            match self.sender.send(ThreadPoolMessage::Run(Box::new(job))) {
+                Err(e) => {
+                    println!("Error sending job to worker channel: {:?}", e);
+                }
+                Ok(_) => {}
+            }
+        }
+    }
+
+    impl Drop for SharedQueueThreadPool {
+        fn drop(&mut self) {
+            if thread::panicking() {
+                println!("dropped while unwinding panic");
+                return;
+            }
+            for _ in 0..self.workers.len() {
+                if let Err(e) = self.sender.send(ThreadPoolMessage::Shutdown) {
+                    println!("Failed to send while shutting down: {:?}", e);
+                }
+            }
+            for worker in &mut self.workers {
+                if let Some(thread) = worker.join_handle.take() {
+                    if let Err(e) = thread.join() {
+                        println!("Failed to join while shutting down: {:?}", e);
+                    }
+                }
+            }
         }
     }
 
     pub struct RayonThreadPool {
-        pool: rayon::ThreadPool
+        pool: rayon::ThreadPool,
     }
     impl ThreadPool for RayonThreadPool {
         fn new(threads: u32) -> Result<Self>
@@ -127,7 +179,9 @@ pub mod thread_pool {
             Self: Sized,
         {
             Ok(RayonThreadPool {
-                pool: rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build()?
+                pool: rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads as usize)
+                    .build()?,
             })
         }
 
