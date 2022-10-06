@@ -215,20 +215,26 @@ pub mod store {
     use std::fmt::Debug;
     use std::fmt::Display;
     use std::fs;
+    use std::fs::File;
     use std::fs::OpenOptions;
+    use std::io;
+    use std::io::BufWriter;
     use std::io::Cursor;
     use std::io::Read;
     use std::io::{Seek, SeekFrom, Write};
     use std::marker::PhantomData;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::PoisonError;
     use std::sync::RwLock;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
     use std::{collections::HashMap, hash::Hash};
 
+    use dashmap::DashMap;
     use serde::{Deserialize, Serialize};
 
     use crate::{KvsEngine, KvsError, Result};
@@ -257,12 +263,10 @@ pub mod store {
         file_path: PathBuf,
     }
 
-    struct InnerStructs<K> {
-        dir_path: PathBuf,
-        bytes_in_last_file: u64,
-        active_file: PathBuf,
-        inactive_files: Vec<PathBuf>,
-        key_map: HashMap<K, ValueData>,
+    struct BufWriterWithPosition<T: Write> {
+        buf_writer: BufWriter<T>,
+        path: PathBuf,
+        position: u64,
     }
 
     #[derive(Clone)]
@@ -271,7 +275,10 @@ pub mod store {
         K: Key,
         V: Value,
     {
-        inner: Arc<RwLock<InnerStructs<K>>>,
+        path: Arc<PathBuf>,
+        writer: Arc<Mutex<BufWriterWithPosition<File>>>,
+        index: Arc<DashMap<K, ValueData>>,
+        uncompressed_bytes: u64,
         phantom: PhantomData<V>,
     }
 
@@ -285,7 +292,7 @@ pub mod store {
             Ok(())
         }
         fn get(&self, key: K) -> Result<Option<V>> {
-            if let Some(value_data) = self.inner.read()?.key_map.get(&key) {
+            if let Some(value_data) = self.index.get(&key) {
                 let mut file = OpenOptions::new()
                     .read(true)
                     .open(value_data.file_path.clone())?;
@@ -349,28 +356,20 @@ pub mod store {
             Ok(path)
         }
 
-        fn alloc_new_file_if_needed(&self) -> Result<()> {
-            let mut inner = self.inner.write()?;
-            if inner.bytes_in_last_file > 1000000 {
-                if inner.inactive_files.len() >= 10 {
-                    self.compact_files()?;
-                    return Ok(());
-                }
-                let old_active = inner.active_file.clone();
-                inner.inactive_files.push(old_active);
-                inner.active_file = KvStore::<K, V>::alloc_new_file(&inner.dir_path)?;
-                inner.bytes_in_last_file = 0;
-            }
-            Ok(())
-        }
-
-        fn new(db_path: &Path) -> Result<InnerStructs<K>> {
+        fn compress_dir_files(db_path: &Path) -> Result<PathBuf> {
             if !db_path.exists() {
                 fs::create_dir_all(&db_path)?;
             }
-            let mut files = vec![];
-            let mut bytes_in_last_file: u64 = 0;
-            for file in fs::read_dir(&db_path)? {
+            let mut files_in_dir = fs::read_dir(&db_path)?;
+            let path = files_in_dir
+                .next()
+                .map(|f| f.unwrap().path())
+                .unwrap_or(KvStore::<K, V>::alloc_new_file(db_path)?);
+            let mut final_file = fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(&path)?;
+            for file in files_in_dir {
                 let file = file.unwrap();
                 if file
                     .path()
@@ -378,143 +377,129 @@ pub mod store {
                     .map(|osstr| (*osstr).to_str().map(|str| str == "kvs").unwrap_or(false))
                     .unwrap_or(false)
                 {
-                    files.push(file.path());
-                    bytes_in_last_file = file.metadata()?.len();
+                    let mut to_copy = fs::OpenOptions::new().read(true).open(file.path())?;
+                    io::copy(&mut final_file, &mut to_copy)?;
                 }
             }
-            if files.is_empty() {
-                files.push(KvStore::<K, V>::alloc_new_file(&db_path)?);
-            }
-            Ok(InnerStructs {
-                dir_path: db_path.to_owned(),
-                key_map: HashMap::new(),
-                active_file: files.pop().unwrap(),
-                inactive_files: files,
-                bytes_in_last_file,
-            })
+            Ok(path)
         }
 
         fn write_command(&self, command: &KvRecord<K, V>, key: K) -> Result<()> {
             let serialized = rmp_serde::to_vec(command)?;
-            let mut inner_structs = self.inner.write()?;
+            let mut writer = self.writer.lock()?;
             let value_data = ValueData {
-                offset: inner_structs.bytes_in_last_file,
+                offset: writer.position,
                 size: serialized.len(),
-                file_path: inner_structs.active_file.clone(),
+                file_path: writer.path.clone(),
             };
-            inner_structs.key_map.insert(key, value_data);
-            let mut file = OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(&inner_structs.active_file)
-                .unwrap();
-            file.write_all(&serialized)?;
-            inner_structs.bytes_in_last_file += serialized.len() as u64;
-            drop(inner_structs);
-            if let Err(err) = self.alloc_new_file_if_needed() {
-                println!("Error compacting: {:?}", err);
-            }
+            writer.buf_writer.write_all(&serialized)?;
+            writer.buf_writer.flush()?;
+            self.index.insert(key, value_data);
+            // TODO: Update uncompressed value
+            writer.position += serialized.len() as u64;
+            drop(writer);
             Ok(())
         }
 
-        fn deserialize_files(
-            files: &[PathBuf],
+        fn deserialize_file(
+            file_path: &PathBuf,
             mut f: impl FnMut(KvRecord<K, V>, ValueData) -> (),
         ) -> Result<()> {
-            for file_path in files {
-                let file = fs::read(&file_path)?;
-                let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(&file));
-                let mut position: u64 = 0;
-                while position < file.len() as u64 {
-                    let deserialized: KvRecord<K, V> =
-                        serde::Deserialize::deserialize(&mut deserializer)?;
-                    // println!("Deserialized: {:?}", deserialized);
-                    let new_position = rmp_serde::decode::Deserializer::position(&deserializer);
-                    let value_data = ValueData {
-                        offset: position,
-                        size: (new_position - position) as usize,
-                        file_path: file_path.clone(),
-                    };
-                    f(deserialized, value_data);
-                    position = new_position;
-                }
+            let file = fs::read(file_path)?;
+            let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(&file));
+            let mut position: u64 = 0;
+            while position < file.len() as u64 {
+                let deserialized: KvRecord<K, V> =
+                    serde::Deserialize::deserialize(&mut deserializer)?;
+                // println!("Deserialized: {:?}", deserialized);
+                let new_position = rmp_serde::decode::Deserializer::position(&deserializer);
+                let value_data = ValueData {
+                    offset: position,
+                    size: (new_position - position) as usize,
+                    file_path: file_path.clone(),
+                };
+                f(deserialized, value_data);
+                position = new_position;
             }
             Ok(())
         }
 
         pub fn open(db_path: &Path) -> Result<KvStore<K, V>> {
-            let mut inner = KvStore::<K, V>::new(db_path)?;
-            let mut key_map = HashMap::new();
-            let all_files = [
-                inner.inactive_files.as_slice(),
-                vec![inner.active_file.clone()].as_slice(),
-            ]
-            .concat();
-            KvStore::deserialize_files(&all_files, |deserialized: KvRecord<K, V>, value_data| {
+            let file_path = KvStore::<K, V>::compress_dir_files(db_path)?;
+            let index = Arc::new(DashMap::new());
+            KvStore::deserialize_file(&file_path, |deserialized: KvRecord<K, V>, value_data| {
                 match deserialized {
                     KvRecord::Set(kv) => {
-                        key_map.insert(kv.0, value_data);
+                        index.insert(kv.0, value_data);
                     }
                     KvRecord::Rm(key) => {
-                        key_map.insert(key, value_data);
+                        index.insert(key, value_data);
                     }
                 }
             })?;
-            inner.key_map = key_map;
+            let file = OpenOptions::new().read(true).open(&file_path)?;
             Ok(KvStore {
-                inner: Arc::new(RwLock::new(inner)),
+                path: Arc::new(db_path.to_path_buf()),
+                index,
+                writer: Arc::new(Mutex::new(BufWriterWithPosition {
+                    position: (file.metadata()?.len()),
+                    buf_writer: BufWriter::new(file),
+                    path: file_path,
+                })),
+                uncompressed_bytes: 0,
                 phantom: PhantomData,
             })
         }
 
         fn compact_files(&self) -> Result<()> {
-            let inner = self.inner.read()?;
-            let mut set_map = HashMap::new();
-            KvStore::deserialize_files(
-                &[
-                    inner.inactive_files.as_slice(),
-                    vec![inner.active_file.clone()].as_slice(),
-                ]
-                .concat(),
-                |deserialized: KvRecord<K, V>, _| match deserialized {
-                    KvRecord::Set(kv) => {
-                        set_map.insert(kv.0, Some(kv.1));
-                    }
-                    KvRecord::Rm(k) => {
-                        set_map.insert(k, None);
-                    }
-                },
-            )?;
-            drop(inner);
-            let mut inner = self.inner.write()?;
-            let compacted_path = KvStore::<K, V>::alloc_new_file(&inner.dir_path)?;
-            let mut compacted_file = fs::File::create(&compacted_path)?;
-            let mut next_offset = 0;
-            for entry in &set_map {
-                match entry.1 {
-                    Some(v) => {
-                        let serialized = rmp_serde::to_vec(&KvRecord::Set((entry.0, v)))?;
-                        let value_data = ValueData {
-                            offset: next_offset,
-                            size: serialized.len(),
-                            file_path: compacted_path.clone(),
-                        };
-                        inner.key_map.insert(entry.0.clone(), value_data);
-                        compacted_file.write_all(&serialized)?;
-                        next_offset += serialized.len() as u64;
-                    }
-                    None => {
-                        inner.key_map.remove(entry.0);
-                    }
-                }
-            }
-            for file in &inner.inactive_files {
-                fs::remove_file(file)?;
-            }
-            fs::remove_file(&inner.active_file)?;
-            inner.active_file = compacted_path;
-            inner.inactive_files = vec![];
-            inner.bytes_in_last_file = next_offset;
+            // TODO: reimplement
+            // let inner = self.inner.read()?;
+            // let mut set_map = HashMap::new();
+            // KvStore::deserialize_files(
+            //     &[
+            //         inner.inactive_files.as_slice(),
+            //         vec![inner.active_file.clone()].as_slice(),
+            //     ]
+            //     .concat(),
+            //     |deserialized: KvRecord<K, V>, _| match deserialized {
+            //         KvRecord::Set(kv) => {
+            //             set_map.insert(kv.0, Some(kv.1));
+            //         }
+            //         KvRecord::Rm(k) => {
+            //             set_map.insert(k, None);
+            //         }
+            //     },
+            // )?;
+            // drop(inner);
+            // let mut inner = self.inner.write()?;
+            // let compacted_path = KvStore::<K, V>::alloc_new_file(&inner.dir_path)?;
+            // let mut compacted_file = fs::File::create(&compacted_path)?;
+            // let mut next_offset = 0;
+            // for entry in &set_map {
+            //     match entry.1 {
+            //         Some(v) => {
+            //             let serialized = rmp_serde::to_vec(&KvRecord::Set((entry.0, v)))?;
+            //             let value_data = ValueData {
+            //                 offset: next_offset,
+            //                 size: serialized.len(),
+            //                 file_path: compacted_path.clone(),
+            //             };
+            //             inner.key_map.insert(entry.0.clone(), value_data);
+            //             compacted_file.write_all(&serialized)?;
+            //             next_offset += serialized.len() as u64;
+            //         }
+            //         None => {
+            //             inner.key_map.remove(entry.0);
+            //         }
+            //     }
+            // }
+            // for file in &inner.inactive_files {
+            //     fs::remove_file(file)?;
+            // }
+            // fs::remove_file(&inner.active_file)?;
+            // inner.active_file = compacted_path;
+            // inner.inactive_files = vec![];
+            // inner.bytes_in_last_file = next_offset;
             Ok(())
         }
     }

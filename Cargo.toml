@@ -24,6 +24,7 @@ log = "0.4.17"
 stderrlog = "0.5.3"
 rmp-serde = "^1.1.0"
 rayon = "^1.5.3"
+dashmap = "^5.4.0"
 
 
 [[bench]]
