@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -65,7 +67,6 @@ fn get_new_file_path(dir_path: &Path) -> PathBuf {
     ))
 }
 
-#[derive(Clone)]
 pub struct KvStore<K, V>
 where
     K: Key,
@@ -75,8 +76,25 @@ where
     writer: Arc<Mutex<BufWriterWithPosition<File>>>,
     reader: Arc<File>,
     index: Arc<DashMap<K, ValueData>>,
-    uncompressed_bytes: u64,
+    uncompressed_bytes: AtomicU64,
     phantom: PhantomData<V>,
+}
+
+impl <K,V> Clone for KvStore<K, V>
+where
+    K: Key,
+    V: Value,
+{
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            writer: self.writer.clone(),
+            reader: self.reader.clone(),
+            index: self.index.clone(),
+            uncompressed_bytes: AtomicU64::new(self.uncompressed_bytes.load(Ordering::SeqCst)),
+            phantom: self.phantom.clone()
+        }
+    }
 }
 
 impl<K, V> KvsEngine<K, V> for KvStore<K, V>
@@ -151,7 +169,6 @@ where
             .create(true)
             .open(&path)?;
         for file in files_in_dir {
-            println!("More than 1 file in directory");
             let file = file.unwrap();
             if file
                 .path()
@@ -173,14 +190,14 @@ where
             offset: writer.position,
             size: serialized.len(),
         };
-        println!("File position before writing {}", writer.buf_writer.get_ref().seek(SeekFrom::Current(0))?);
         writer.buf_writer.write_all(&serialized)?;
         writer.buf_writer.flush()?;
-        println!("File position after writing {}", writer.buf_writer.get_ref().seek(SeekFrom::Current(0))?);
-        self.index.insert(key, value_data);
-        // TODO: Update uncompressed value
         writer.position += serialized.len() as u64;
         drop(writer);
+        if let Some(previous_value) = self.index.insert(key, value_data) {
+            self.uncompressed_bytes.fetch_add(previous_value.size as u64, Ordering::SeqCst);
+        }
+        // TODO: Update uncompressed value
         Ok(())
     }
 
@@ -188,13 +205,11 @@ where
         file_path: &PathBuf,
         mut f: impl FnMut(KvRecord<K, V>, ValueData) -> (),
     ) -> Result<()> {
-        println!("Deserializing: {}", file_path.to_string_lossy());
         let file = fs::read(file_path)?;
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(&file));
         let mut position: u64 = 0;
         while position < file.len() as u64 {
             let deserialized: KvRecord<K, V> = serde::Deserialize::deserialize(&mut deserializer)?;
-            // println!("Deserialized: {:?}", deserialized);
             let new_position = rmp_serde::decode::Deserializer::position(&deserializer);
             let value_data = ValueData {
                 offset: position,
@@ -203,7 +218,6 @@ where
             f(deserialized, value_data);
             position = new_position;
         }
-        println!("Deserialized");
         Ok(())
     }
 
@@ -232,7 +246,7 @@ where
                 position: (write_buf.metadata()?.len()),
                 buf_writer: BufWriter::new(write_buf),
             })),
-            uncompressed_bytes: 0,
+            uncompressed_bytes: AtomicU64::new(0),
             phantom: PhantomData,
         })
     }
