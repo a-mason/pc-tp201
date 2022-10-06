@@ -1,5 +1,5 @@
-use kvs::store::KvStore;
-use kvs::{KvsEngine, Result};
+use kvs::engine::{store::KvStore, KvsEngine};
+use kvs::Result;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;

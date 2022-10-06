@@ -1,6 +1,9 @@
 use clap::clap_derive::ArgEnum;
 use clap::Parser;
-use kvs::{thread_pool::NaiveThreadPool, thread_pool::ThreadPool, KvsEngine, KvsError, Result};
+use kvs::{
+    engine::KvsEngine, thread_pool::shared_queue::SharedQueueThreadPool, thread_pool::ThreadPool,
+    KvsError, Result,
+};
 use log::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -61,7 +64,7 @@ fn parse_kv_config(db_path: &Path, engine: Option<KvsEngineType>) -> Result<KvsE
 
 fn start_listening(addr: SocketAddr, store: impl KvsEngine<String, String>) -> kvs::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    let thread_pool = NaiveThreadPool::new(10)?;
+    let thread_pool = SharedQueueThreadPool::new(10)?;
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
@@ -114,10 +117,10 @@ fn main() -> kvs::Result<()> {
     info!("final engine: {:?}", engine);
 
     match engine {
-        KvsEngineType::Kvs => start_listening(args.addr, kvs::store::KvStore::open(path)?),
+        KvsEngineType::Kvs => start_listening(args.addr, kvs::engine::store::KvStore::open(path)?),
         KvsEngineType::Sled => start_listening(
             args.addr,
-            kvs::sled::SledKvsEngine::new(&path.join("sled"))?,
+            kvs::engine::sled::SledKvsEngine::new(&path.join("sled"))?,
         ), // Need to implement Sled Engine
     }
 }

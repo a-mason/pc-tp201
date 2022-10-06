@@ -5,6 +5,9 @@ use kvs::thread_pool::*;
 use kvs::Result;
 
 use crossbeam_utils::sync::WaitGroup;
+use kvs::thread_pool::naive::NaiveThreadPool;
+use kvs::thread_pool::rayon::RayonThreadPool;
+use kvs::thread_pool::shared_queue::SharedQueueThreadPool;
 
 fn spawn_counter<P: ThreadPool>(pool: P) -> Result<()> {
     const TASK_NUM: usize = 20;

@@ -1,11 +1,11 @@
-use kvs::sled::SledKvsEngine;
+use kvs::engine::sled::SledKvsEngine;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::path::Path;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use kvs::store::KvStore;
-use kvs::KvsEngine;
+use kvs::engine::store::KvStore;
+use kvs::engine::KvsEngine;
 
 fn gen_keys_values(num: usize, size: usize) -> Vec<(String, String)> {
     let mut kvs: Vec<(String, String)> = Vec::with_capacity(num);
