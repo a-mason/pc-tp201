@@ -7,9 +7,11 @@ use std::hash::Hash;
 use std::io;
 use std::io::BufWriter;
 use std::io::Cursor;
-use std::io::Read;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::marker::PhantomData;
+use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,13 +47,22 @@ enum KvRecord<K, V> {
 struct ValueData {
     size: usize,
     offset: u64,
-    file_path: PathBuf,
 }
 
 struct BufWriterWithPosition<T: Write> {
     buf_writer: BufWriter<T>,
-    path: PathBuf,
     position: u64,
+}
+
+fn get_new_file_path(dir_path: &Path) -> PathBuf {
+    dir_path.join(format!(
+        "{}.kvs",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos()
+            .to_string()
+    ))
 }
 
 #[derive(Clone)]
@@ -62,6 +73,7 @@ where
 {
     path: Arc<PathBuf>,
     writer: Arc<Mutex<BufWriterWithPosition<File>>>,
+    reader: Arc<File>,
     index: Arc<DashMap<K, ValueData>>,
     uncompressed_bytes: u64,
     phantom: PhantomData<V>,
@@ -78,12 +90,8 @@ where
     }
     fn get(&self, key: K) -> Result<Option<V>> {
         if let Some(value_data) = self.index.get(&key) {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .open(value_data.file_path.clone())?;
-            file.seek(SeekFrom::Start(value_data.offset as u64))?;
             let mut buf = vec![0u8; value_data.size];
-            file.read_exact(&mut buf)?;
+            self.reader.read_exact_at(&mut buf, value_data.offset)?;
             match rmp_serde::from_slice(&buf)? {
                 KvRecord::Set(kv) => {
                     let _key: K = kv.0;
@@ -128,19 +136,6 @@ where
     K: Key,
     V: Value,
 {
-    fn alloc_new_file(dir_path: &Path) -> Result<PathBuf> {
-        let path = dir_path.join(format!(
-            "{}.kvs",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time went backwards")
-                .as_nanos()
-                .to_string()
-        ));
-        fs::File::create(&path)?;
-        Ok(path)
-    }
-
     fn compress_dir_files(db_path: &Path) -> Result<PathBuf> {
         if !db_path.exists() {
             fs::create_dir_all(&db_path)?;
@@ -149,12 +144,14 @@ where
         let path = files_in_dir
             .next()
             .map(|f| f.unwrap().path())
-            .unwrap_or(KvStore::<K, V>::alloc_new_file(db_path)?);
+            .unwrap_or(get_new_file_path(db_path));
         let mut final_file = fs::OpenOptions::new()
             .write(true)
             .append(true)
+            .create(true)
             .open(&path)?;
         for file in files_in_dir {
+            println!("More than 1 file in directory");
             let file = file.unwrap();
             if file
                 .path()
@@ -175,10 +172,11 @@ where
         let value_data = ValueData {
             offset: writer.position,
             size: serialized.len(),
-            file_path: writer.path.clone(),
         };
+        println!("File position before writing {}", writer.buf_writer.get_ref().seek(SeekFrom::Current(0))?);
         writer.buf_writer.write_all(&serialized)?;
         writer.buf_writer.flush()?;
+        println!("File position after writing {}", writer.buf_writer.get_ref().seek(SeekFrom::Current(0))?);
         self.index.insert(key, value_data);
         // TODO: Update uncompressed value
         writer.position += serialized.len() as u64;
@@ -190,6 +188,7 @@ where
         file_path: &PathBuf,
         mut f: impl FnMut(KvRecord<K, V>, ValueData) -> (),
     ) -> Result<()> {
+        println!("Deserializing: {}", file_path.to_string_lossy());
         let file = fs::read(file_path)?;
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(&file));
         let mut position: u64 = 0;
@@ -200,11 +199,11 @@ where
             let value_data = ValueData {
                 offset: position,
                 size: (new_position - position) as usize,
-                file_path: file_path.clone(),
             };
             f(deserialized, value_data);
             position = new_position;
         }
+        println!("Deserialized");
         Ok(())
     }
 
@@ -221,14 +220,17 @@ where
                 }
             }
         })?;
-        let file = OpenOptions::new().read(true).open(&file_path)?;
+        let write_buf = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&file_path)?;
         Ok(KvStore {
             path: Arc::new(db_path.to_path_buf()),
             index,
+            reader: Arc::new(OpenOptions::new().read(true).open(&file_path)?),
             writer: Arc::new(Mutex::new(BufWriterWithPosition {
-                position: (file.metadata()?.len()),
-                buf_writer: BufWriter::new(file),
-                path: file_path,
+                position: (write_buf.metadata()?.len()),
+                buf_writer: BufWriter::new(write_buf),
             })),
             uncompressed_bytes: 0,
             phantom: PhantomData,
@@ -236,6 +238,14 @@ where
     }
 
     fn compact_files(&self) -> Result<()> {
+        // let new_path = get_new_file_path(&self.path);
+        // let new_file = fs::File::create(&new_path)?;
+        // let mut writer = self.writer.lock()?;
+        // let mut to_compress = writer.path.clone();
+        // writer.path = new_path;
+        // writer.position = 0;
+        // writer.buf_writer = BufWriter::new(new_file);
+
         // TODO: reimplement
         // let inner = self.inner.read()?;
         // let mut set_map = HashMap::new();
