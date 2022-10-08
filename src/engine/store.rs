@@ -7,8 +7,6 @@ use std::hash::Hash;
 use std::io;
 use std::io::BufWriter;
 use std::io::Cursor;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::marker::PhantomData;
 use std::os::unix::prelude::FileExt;
@@ -53,6 +51,7 @@ struct ValueData {
 
 struct BufWriterWithPosition<T: Write> {
     buf_writer: BufWriter<T>,
+    path: PathBuf,
     position: u64,
 }
 
@@ -103,7 +102,18 @@ where
     V: Value,
 {
     fn set(&self, key: K, val: V) -> Result<()> {
-        self.write_command(&KvRecord::Set((key.clone(), val.clone())), key)?;
+        let serialized = rmp_serde::to_vec(&KvRecord::Set((key.clone(), val)))?;
+        let mut writer = self.writer.lock()?;
+        let value_data = ValueData {
+            offset: writer.position,
+            size: serialized.len(),
+        };
+        writer.buf_writer.write_all(&serialized)?;
+        writer.buf_writer.flush()?;
+        writer.position += serialized.len() as u64;
+        if let Some(previous_value) = self.index.insert(key, value_data) {
+            self.uncompressed_bytes.fetch_add(previous_value.size as u64, Ordering::SeqCst);
+        }
         Ok(())
     }
     fn get(&self, key: K) -> Result<Option<V>> {
@@ -122,8 +132,17 @@ where
         }
     }
     fn remove(&self, key: K) -> Result<()> {
-        if let Ok(Some(_val)) = self.get(key.clone()) {
-            self.write_command(&KvRecord::Rm::<K, V>(key.clone()), key)?;
+        let mut writer = self.writer.lock()?;
+        if let Some(previous_value) = self.index.remove(&key) {
+            let serialized = rmp_serde::to_vec(&KvRecord::<K, V>::Rm(key.clone()))?;
+            let value_data = ValueData {
+                offset: writer.position,
+                size: serialized.len(),
+            };
+            writer.buf_writer.write_all(&serialized)?;
+            writer.buf_writer.flush()?;
+            writer.position += serialized.len() as u64;
+            self.uncompressed_bytes.fetch_add((previous_value.1.size + value_data.size) as u64, Ordering::SeqCst);
             Ok(())
         } else {
             Err(KvsError::NonExistantKey)
@@ -183,27 +202,9 @@ where
         Ok(path)
     }
 
-    fn write_command(&self, command: &KvRecord<K, V>, key: K) -> Result<()> {
-        let serialized = rmp_serde::to_vec(command)?;
-        let mut writer = self.writer.lock()?;
-        let value_data = ValueData {
-            offset: writer.position,
-            size: serialized.len(),
-        };
-        writer.buf_writer.write_all(&serialized)?;
-        writer.buf_writer.flush()?;
-        writer.position += serialized.len() as u64;
-        drop(writer);
-        if let Some(previous_value) = self.index.insert(key, value_data) {
-            self.uncompressed_bytes.fetch_add(previous_value.size as u64, Ordering::SeqCst);
-        }
-        // TODO: Update uncompressed value
-        Ok(())
-    }
-
     fn deserialize_file(
         file_path: &PathBuf,
-        mut f: impl FnMut(KvRecord<K, V>, ValueData) -> (),
+        mut f: impl FnMut(KvRecord<K, V>, ValueData) -> Result<()>,
     ) -> Result<()> {
         let file = fs::read(file_path)?;
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(&file));
@@ -215,7 +216,7 @@ where
                 offset: position,
                 size: (new_position - position) as usize,
             };
-            f(deserialized, value_data);
+            f(deserialized, value_data)?;
             position = new_position;
         }
         Ok(())
@@ -225,14 +226,14 @@ where
         let file_path = KvStore::<K, V>::compress_dir_files(db_path)?;
         let index = Arc::new(DashMap::new());
         KvStore::deserialize_file(&file_path, |deserialized: KvRecord<K, V>, value_data| {
-            match deserialized {
+            Ok(match deserialized {
                 KvRecord::Set(kv) => {
                     index.insert(kv.0, value_data);
                 }
                 KvRecord::Rm(key) => {
                     index.insert(key, value_data);
                 }
-            }
+            })
         })?;
         let write_buf = OpenOptions::new()
             .write(true)
@@ -243,6 +244,7 @@ where
             index,
             reader: Arc::new(OpenOptions::new().read(true).open(&file_path)?),
             writer: Arc::new(Mutex::new(BufWriterWithPosition {
+                path: file_path,
                 position: (write_buf.metadata()?.len()),
                 buf_writer: BufWriter::new(write_buf),
             })),
@@ -251,14 +253,40 @@ where
         })
     }
 
-    fn compact_files(&self) -> Result<()> {
+    fn compact_file(&self) -> Result<()> {
         // let new_path = get_new_file_path(&self.path);
-        // let new_file = fs::File::create(&new_path)?;
-        // let mut writer = self.writer.lock()?;
-        // let mut to_compress = writer.path.clone();
-        // writer.path = new_path;
-        // writer.position = 0;
-        // writer.buf_writer = BufWriter::new(new_file);
+        // let mut new_file = fs::File::create(&new_path)?;
+        // let writer = self.writer.lock()?;
+        // let new_map = DashMap::new();
+        // KvStore::deserialize_file(&writer.path,
+        //     |deserialized: KvRecord<K, V>, value_data| match &deserialized {
+        //         KvRecord::Set((key, _value)) => {
+        //             if let Some(entry) = self.index.get(&key) {
+        //                 if entry.offset == value_data.offset {
+        //                     let serialized = rmp_serde::to_vec(&deserialized)?;
+        //                     new_file.write_all(&serialized)?;
+        //                     let value_data = ValueData {
+        //                         offset: new_file.metadata()?.len(),
+        //                         size: serialized.len(),
+        //                     };
+        //                     new_map.insert(entry.key().clone(), value_data);
+        //                 }
+        //             }
+        //             Ok(())
+        //         }
+        //         KvRecord::Rm(_key) => Ok(())
+        //     },
+        // )?;
+        // writer.buf_writer = BufWriterWithPosition {
+        //     path: new_path,
+        //     buf_writer: BufWriter::new(new_file),
+        //     position: new_file.metadata()?.len()
+        // };
+        // self.index = new_map;
+        // self.uncompressed_bytes = 0;
+        // self.reader = OpenOptions::new().read(true).open(&new_path)?;
+        Ok(())
+    }
 
         // TODO: reimplement
         // let inner = self.inner.read()?;
@@ -308,8 +336,7 @@ where
         // inner.active_file = compacted_path;
         // inner.inactive_files = vec![];
         // inner.bytes_in_last_file = next_offset;
-        Ok(())
-    }
+        // Ok(())
 }
 
 // impl<K, V> Drop for KvStore<K, V>
