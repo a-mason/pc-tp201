@@ -10,8 +10,6 @@ use std::io::BufWriter;
 use std::io::Cursor;
 use std::io::Write;
 use std::marker::PhantomData;
-use std::mem::replace;
-use std::ops::Deref;
 use std::os::unix::prelude::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -48,6 +46,7 @@ enum KvRecord<K, V> {
     Rm(K),
 }
 
+#[derive(Debug)]
 struct ValueData {
     size: usize,
     offset: u64,
@@ -116,14 +115,18 @@ where
         writer.buf_writer.flush()?;
         writer.position += serialized.len() as u64;
         if let Some(previous_value) = self.index.insert(key, value_data) {
-            self.uncompressed_bytes.fetch_add(previous_value.size as u64, Ordering::SeqCst);
+            // if we were over 10k then run compaction
+            if self.uncompressed_bytes.fetch_add(previous_value.size as u64, Ordering::SeqCst) > 1000000 {
+                drop(writer);
+                self.compact_file()?;
+            }
         }
         Ok(())
     }
     fn get(&self, key: K) -> Result<Option<V>> {
-        if let Some(value_data) = self.index.get(&key) {
-            let mut buf = vec![0u8; value_data.size];
-            self.reader.read()?.read_exact_at(&mut buf, value_data.offset)?;
+        if let Some(entry) = self.index.get(&key) {
+            let mut buf = vec![0u8; entry.value().size];
+            self.reader.read()?.read_exact_at(&mut buf, entry.value().offset)?;
             match rmp_serde::from_slice(&buf)? {
                 KvRecord::Set(kv) => {
                     let _key: K = kv.0;
@@ -146,7 +149,11 @@ where
             writer.buf_writer.write_all(&serialized)?;
             writer.buf_writer.flush()?;
             writer.position += serialized.len() as u64;
-            self.uncompressed_bytes.fetch_add((previous_value.1.size + value_data.size) as u64, Ordering::SeqCst);
+            // if we were over 10k then run compaction
+            if self.uncompressed_bytes.fetch_add((previous_value.1.size + value_data.size) as u64, Ordering::SeqCst) > 1000000 {
+                drop(writer);
+                self.compact_file()?;
+            }
             Ok(())
         } else {
             Err(KvsError::NonExistantKey)
@@ -258,9 +265,6 @@ where
     }
 
     fn compact_file(&self) -> Result<()> {
-        // TODO: compare/swap uncompressed_bytes to determine whether or not we should compact.
-        // We may just want to store the uncompressed_bytes with the writer lock because it updates
-        // in step with it
         let mut value_map = HashMap::new();
         let new_path = get_new_file_path(&self.path);
         let mut new_file = fs::File::create(&new_path)?;
@@ -270,11 +274,14 @@ where
                 KvRecord::Set(kv) => {
                     value_map.insert(kv.0, kv.1);
                 }
-                KvRecord::Rm(_k) => {}
+                KvRecord::Rm(k) => {
+                    // I dont think this should ever happen, but just to be sure
+                    value_map.remove(&k);
+                }
             },
         )?;
         let mut next_offset = 0;
-        let new_index = DashMap::new();
+        let mut new_index = HashMap::new();
         for (key, val) in value_map {
             let serialized = rmp_serde::to_vec(&KvRecord::Set((key.clone(), val)))?;
             let value_data = ValueData {
@@ -283,28 +290,21 @@ where
             };
             new_index.insert(key, value_data);
             new_file.write_all(&serialized)?;
+            new_file.flush()?;
             next_offset += serialized.len() as u64;
         }
+        let old_path = writer.path.clone();
         writer.buf_writer = BufWriter::new(new_file);
         writer.position = next_offset;
         writer.path = new_path.clone();
         self.uncompressed_bytes.store(0, Ordering::SeqCst);
         let mut reader = self.reader.write()?;
         *reader = OpenOptions::new().read(true).open(&new_path)?;
+        new_index.clear();
         for (key, value) in new_index {
             self.index.insert(key, value);
         }
+        fs::remove_file(&old_path)?;
         Ok(())
     }
 }
-
-// impl<K, V> Drop for KvStore<K, V>
-// where
-//     K: Key,
-//     V: Value,
-// {
-//     fn drop(&mut self) {
-//         self.compact_files()
-//             .expect("Could not compact files on drop");
-//     }
-// }
