@@ -76,6 +76,9 @@ where
 {
     path: Arc<PathBuf>,
     writer: Arc<Mutex<BufWriterWithPosition<File>>>,
+    // All readers can read from the buffer even when performing writes or compaction
+    // However, when compaction is complete and we want to block reading as we flip to the new
+    // reader and index map
     reader: Arc<RwLock<File>>,
     index: Arc<DashMap<K, ValueData>>,
     uncompressed_bytes: AtomicU64,
